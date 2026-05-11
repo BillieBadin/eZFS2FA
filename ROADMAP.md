@@ -1,5 +1,9 @@
 # ROADMAP
 
+## Miscellaneous
+
+- Add a command to remove a wrrapper (thank you Vivian)
+
 ## One single wrapper for multiple datasets/keys
 
 - Support a single wrapper for multiple datasets and keys
