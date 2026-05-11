@@ -1,0 +1,23 @@
+#!/bin/sh
+# eZFS2FA+ is a hardened encrypted ZFS dataset interactive workflow offering two-factor authentication for sensitive services on FreeBSD systems, with Linux compatibility built in.
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Billie Badin, SIGORYX Engineering
+
+# FreeBSD ezfs2fa wrapper.
+
+PYTHON="${PYTHON:-/usr/local/bin/python3.11}"
+SCRIPT="/usr/local/libexec/ezfs2fa/ezfs2fa.py"
+CONFIG="${EZFS2FA_CONFIG:-/usr/local/etc/ezfs2fa.json}"
+
+if [ ! -x "$PYTHON" ]; then
+    if command -v python3.11 >/dev/null 2>&1; then
+        PYTHON="$(command -v python3.11)"
+    elif command -v python3 >/dev/null 2>&1; then
+        PYTHON="$(command -v python3)"
+    else
+        echo "ERROR: python3.11 or python3 is required" >&2
+        exit 1
+    fi
+fi
+
+exec "$PYTHON" "$SCRIPT" -c "$CONFIG" "$@"
