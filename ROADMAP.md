@@ -13,3 +13,7 @@
 ## ProxMox integration
 
 - Integrate the creation of encrypted zvols (for VMs) or datasets (for containers) into ProxMox VE
+
+## File-backed
+
+- Support creating a file-backed encrypted zpool
