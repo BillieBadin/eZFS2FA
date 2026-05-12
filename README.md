@@ -4,6 +4,16 @@
 
 ![eZFS2FA+ repo image](media/eZFS2FA+_GitHub.jpg)
 
+<div align="center">
+
+[![Licence](https://img.shields.io/badge/Licence-MIT-blue?style=flat-square)](LICENSE)&nbsp;
+[![ZFS](https://img.shields.io/badge/ZFS-Native_Encryption-0078D6?style=flat-square)](#)&nbsp;
+[![2FA](https://img.shields.io/badge/2FA-FIDO2-00AA88?style=flat-square)](#)&nbsp;
+[![FreeBSD](https://img.shields.io/badge/FreeBSD-Native-AB2B28?style=flat-square&logo=freebsd&logoColor=white)](https://www.freebsd.org/)&nbsp;
+[![Linux](https://img.shields.io/badge/Linux-Supported-FCC624?style=flat-square&logo=linux&logoColor=black)](https://kernel.org/)
+
+</div>
+
 💡 The idea is simple: protected services do not start at boot. Their secrets live inside an OpenZFS encrypted dataset that remains locked until the operator explicitly unlocks it.
 
 🔐 The key is wrapped using a FIDO Alliance compatible hardware token (like the keys manufactured by Yubico), a passphrase, or both (recommended).
