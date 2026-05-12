@@ -1,0 +1,62 @@
+@startuml
+' eZFS2FA+ is a hardened encrypted ZFS dataset interactive workflow offering two-factor authentication for sensitive services on FreeBSD systems, with Linux compatibility built in.
+' SPDX-License-Identifier: MIT
+' SPDX-FileCopyrightText: 2026 Billie Badin, SIGORYX Engineering
+
+title eZFS2FA+ key unwrap ceremony (unwrap_key_record + crypto path)
+
+start
+:read wrapper JSON;
+:verify wrap_version == WRAP_VERSION;
+
+if (version mismatch?) then (yes)
+    :raise Error("unsupported wrapper version");
+    stop
+endif
+
+:read factor flags (passphrase/fido2);
+if (both disabled?) then (yes)
+    :raise Error("wrapper has neither factor");
+    stop
+endif
+
+if (FIDO enabled?) then (yes)
+    :fido_secret = FidoManager.hmac_secret(wrapper, rp_id, device);
+else (no)
+    :fido_secret = None;
+endif
+
+if (Passphrase enabled?) then (yes)
+    :prompt passphrase once;
+    :load stored kdf params from wrapper;
+    :passphrase_material = scrypt(...stored params...);
+else (no)
+    :passphrase=None; kdf_name=none;
+endif
+
+:derive_wrap_keys(...) with same context rules;
+:decode iv/ciphertext/expected_tag from base64;
+:actual_tag = HMAC-SHA256(mac_key, context + iv + ciphertext);
+:constant-time compare_digest(expected_tag, actual_tag);
+
+if (tag mismatch?) then (yes)
+    :raise Error("HMAC verification failed");
+    stop
+endif
+
+:raw_key = AES-256-CTR decrypt(ciphertext, aes_key, iv);
+:validate_raw_key(len == 32);
+
+if (length invalid?) then (yes)
+    :raise Error("raw key must be exactly 32 bytes");
+    stop
+endif
+
+:return raw_key to caller (unlock/export/add path);
+stop
+
+footer
+
+© 2026 Billie Badin, SIGORYX Engineering | MIT License | https://github.com/BillieBadin/eZFS2FA
+endfooter
+@enduml

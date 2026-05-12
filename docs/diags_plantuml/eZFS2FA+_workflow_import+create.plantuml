@@ -1,0 +1,65 @@
+@startuml
+' eZFS2FA+ is a hardened encrypted ZFS dataset interactive workflow offering two-factor authentication for sensitive services on FreeBSD systems, with Linux compatibility built in.
+' SPDX-License-Identifier: MIT
+' SPDX-FileCopyrightText: 2026 Billie Badin, SIGORYX Engineering
+
+title eZFS2FA+ create --import workflow (migrate existing encrypted dataset)
+
+start
+:cmd_create(import_existing=True);
+:require_root();
+:require_commands(["zfs"]);
+:cfg = ensure_config(path);
+:dataset/rp_id/name resolution;
+:resolve_auth_flags();
+
+if (dataset already in config AND not -f?) then (yes)
+    :raise Error("dataset already exists in config");
+    stop
+endif
+
+:key_status = zfs get keystatus;
+if (key_status != "available") then (yes)
+    :raise Error("dataset must be unlocked before import");
+    stop
+endif
+
+:encryption = zfs get encryption;
+if (encryption == "off") then (yes)
+    :raise Error("dataset is not encrypted");
+    stop
+endif
+
+:resolve mountpoint/canmount (CLI or zfs properties);
+:operator confirmation (Continue);
+
+if (confirmed?) then (no)
+    :raise Error("cancelled");
+    stop
+endif
+
+:open ScratchSpace(dataset);
+:raw_key = random 32 bytes;
+:entry metadata scaffold;
+:entry.wrappers[first] = wrap_key_record(raw_key,...);
+
+while (enrol another wrapper?) is (yes)
+    :resolve wrapper auth flags;
+    :wrap_key_record(raw_key,...);
+endwhile (no)
+
+:pending_id = start_pending_op(operation="import");
+:scratch.write_key(raw_key);
+:zfsops.change_key(dataset, scratch.key_path());
+:cfg.datasets[dataset] = entry;
+:clear_pending_op(expected_id=pending_id);
+:save_config(cfg);
+
+:print import success + backup warnings;
+stop
+
+footer
+
+© 2026 Billie Badin, SIGORYX Engineering | MIT License | https://github.com/BillieBadin/eZFS2FA
+endfooter
+@enduml

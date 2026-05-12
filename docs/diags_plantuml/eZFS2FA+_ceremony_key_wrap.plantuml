@@ -1,0 +1,72 @@
+@startuml
+' eZFS2FA+ is a hardened encrypted ZFS dataset interactive workflow offering two-factor authentication for sensitive services on FreeBSD systems, with Linux compatibility built in.
+' SPDX-License-Identifier: MIT
+' SPDX-FileCopyrightText: 2026 Billie Badin, SIGORYX Engineering
+
+title eZFS2FA+ key wrap ceremony (wrap_key_record + crypto path)
+
+start
+:validate_raw_key(raw_key == 32 bytes);
+:read factor policy (passphrase/fido2);
+
+if (no factor enabled?) then (yes)
+    :Error from derive_wrap_keys;
+    stop
+endif
+
+if (FIDO enabled?) then (yes)
+    :FidoManager.make_credential(name, rp_id, device);
+    :hmac_salt = random 32 bytes;
+    :store hmac_salt_b64;
+    :fido_secret = FidoManager.hmac_secret(wrapper, rp_id, device);
+else (no)
+    :fido_secret = None;
+endif
+
+if (Passphrase enabled?) then (yes)
+    :prompt passphrase + confirmation;
+    :kdf_params = default_kdf_params();
+    note right
+        kdf_name=scrypt
+        salt=16 random bytes
+        n=32768, r=8, p=3
+        dklen=64
+    end note
+else (no)
+    :passphrase=None; kdf_name=none;
+endif
+
+:derive_wrap_keys(...);
+note right
+    passphrase path:
+    scrypt(passphrase, salt, n, r, p, dklen)
+
+    combine context:
+    WRAP_VERSION + flags + kdf_name
+    + fido_secret + passphrase_material
+
+    SHA-512 digest split:
+    first 32 -> aes_key
+    last  32 -> mac_key
+end note
+
+:iv = random 16 bytes;
+:ciphertext = AES-256-CTR(raw_key, aes_key, iv);
+:tag = HMAC-SHA256(mac_key, context + iv + ciphertext);
+:assemble JSON wrapper record;
+
+note right
+    Stored: iv_b64, wrapped_key_b64, tag_b64,
+    factor flags, kdf metadata, wrap_version,
+    and FIDO credential metadata if enabled.
+
+    Not stored: raw_key plaintext.
+end note
+
+stop
+
+footer
+
+© 2026 Billie Badin, SIGORYX Engineering | MIT License | https://github.com/BillieBadin/eZFS2FA
+endfooter
+@enduml

@@ -43,19 +43,17 @@ You can manually stamp wrapper backup timestamps with `--manualbackup`, but this
 
 ## Security model
 
-The raw 32-byte OpenZFS key is random. Each wrapper encrypts that raw key using one of these modes:
+The raw 32-bytes OpenZFS key is random. Each wrapper encrypts that raw key using one of these modes:
 
-```text
-passphrase only
-FIDO2 hmac-secret only
-passphrase + FIDO2 hmac-secret
-```
+- passphrase only
+- FIDO2 hmac-secret only
+- passphrase + FIDO2 hmac-secret
 
 Every wrapper records two explicit flags:
 
 ```json
 "passphrase": true,
-"fido2": true
+"fido2":      true
 ```
 
 or another combination, depending on how it was created.
@@ -63,13 +61,17 @@ or another combination, depending on how it was created.
 Wrappers are strict `ezfs2fa-wrap-v3.0.0` records. Older wrapper formats are not accepted.
 Config loading is also strict: missing required keys are treated as invalid config and are not auto-migrated.
 
+---
+
 ## Key wrap/unwrap internals (audit)
 
-This section describes exactly how `ezfs2fa` protects the 32-byte OpenZFS raw key.
+This section describes exactly how `ezfs2fa` protects the 32-bytes OpenZFS raw key.
+
+Click on the ***Show: ... diagram*** section title to display the PlantUML workflow diagram.
 
 ### Enrol / wrap path
 
-1. Generate random 32-byte raw key.
+1. Generate random 32-bytes raw key.
 2. Collect enabled factors:
    - passphrase (optional);
    - FIDO2 `hmac-secret` output (optional).
@@ -94,6 +96,12 @@ This section describes exactly how `ezfs2fa` protects the 32-byte OpenZFS raw ke
    - KDF name;
    - IV + ciphertext.
 
+<details>
+<summary><strong>Show: key wrap ceremony diagram</strong></summary>
+<br>
+<img src="./docs/diags_svg/eZFS2FA+_ceremony_key_wrap.svg" alt="Ceremony - key wrap">
+</details>
+
 ### Unlock / unwrap path
 
 1. Validate wrapper version is exactly `ezfs2fa-wrap-v3.0.0`.
@@ -108,42 +116,53 @@ This gives explicit integrity-before-decrypt behavior and binds both factor poli
 
 When FIDO2 is enabled, the tool stores best-effort metadata about the hardware key, including serial number when `ykman list --serials` is available and sees exactly one key. This metadata is informational only. The real binding is the FIDO2 credential and the `hmac-secret` result.
 
+<details>
+<summary><strong>Show: key unwrap ceremony diagram</strong></summary>
+<br>
+<img src="./docs/diags_svg/eZFS2FA+_ceremony_key_unwrap.svg" alt="Ceremony - key wrap">
+</details>
+
+---
+
 ## FIDO2 backend
 
 Only the CLI FIDO2 backend is supported.
 
 Required commands:
 
-```text
-fido2-token
-fido2-cred
-fido2-assert
-```
+- `fido2-token`
+- `fido2-cred`
+- `fido2-assert`
 
-On the tested Pi-BSD/YubiKey setup, `/dev/uhid0` worked reliably while `/dev/hidraw1` could hang. You can force the device path with:
+On the tested Pi-BSD/YubiKey setup, `/dev/uhid0` worked reliably while `/dev/hidraw1` could hang.
+You can force the device path with:
 
 ```sh
-ezfs2fa fido-list -D /dev/uhid0
+ezfs2fa fido-list -D /dev/uhid0`
 ```
 
 During FIDO operations:
 
 1. enter the PIN if prompted;
-2. touch the key when it flashes.
+2. touch the key when it flashes (The prompt to touch isn't explicit, and easily forgotten. You'll get used to it!).
 
-The CLI backend uses explicit `-i` and `-o` files for `fido2-cred` and `fido2-assert`, because that was the reliable libfido2 path on FreeBSD. Those temporary FIDO files are created on the same volatile scratch storage used for ZFS key material and are wiped immediately.
+The CLI backend uses explicit `-i` and `-o` files for `fido2-cred` and `fido2-assert`, because that was the reliable `libfido2` path on FreeBSD.
+Those temporary FIDO files are created on the same volatile scratch storage used for ZFS key material and are wiped immediately.
 
 ## Volatile scratch space
 
 The scratch layer is transparent to the user.
 
+### FreeBSD
 On FreeBSD, `ezfs2fa` uses:
 
 ```sh
 mdmfs -M -s 1m -p 0700 -w root:wheel -o noatime md /var/run/ezfs2fa/<label>
 ```
 
-This creates a malloc-backed md(4) disk, creates UFS on it, and mounts it. The raw ZFS key is written as a regular 32-byte file on that volatile filesystem so OpenZFS can consume it through `file://...`.
+This creates a malloc-backed md(4) disk, creates UFS on it, and mounts it. The raw ZFS key is written as a regular 32-bytes file on that volatile filesystem so OpenZFS can consume it through `file://...`.
+
+### Linux
 
 On Linux, `ezfs2fa` uses:
 
@@ -153,35 +172,38 @@ mount -t ramfs -o mode=0700 ramfs /var/run/ezfs2fa/<label>
 
 `ramfs` is not size-limited, so the tool only writes tiny files there and removes them immediately. Do not use `/var/run/ezfs2fa` as general scratch storage.
 
-After use, the key file is wiped, the filesystem is unmounted, and the backing storage is released. On FreeBSD, the md device is also overwritten where possible before detach.
+### Shared
 
-This avoids writing the raw key to persistent storage. It does not protect against a live compromised root account or kernel.
+After use, the key file is wiped, the filesystem is unmounted, and the backing storage is released.
+On FreeBSD, the md device is also overwritten where possible before detach.
+
+⚠️ While the chosen solution for the scratch avoids writing the raw key to persistent storage, it **does not protect against a live compromised root account or kernel**.
 
 ## Installed layout
 
-FreeBSD:
+The installed wrapper is OS-specific.
 
-```text
-/usr/local/sbin/ezfs2fa
-/usr/local/libexec/ezfs2fa/ezfs2fa.py
-/usr/local/libexec/ezfs2fa/ezfs2fa_lib/*.py
-/usr/local/etc/ezfs2fa.json
-/usr/local/share/doc/ezfs2fa/README.md
-/usr/local/man/man8/ezfs2fa.8.gz
-```
+- The FreeBSD wrapper uses `/usr/local/etc/ezfs2fa.json`;
+- the Linux wrapper uses `/etc/ezfs2fa.json`.
+- Both pass arguments through unchanged.
 
-Linux:
+### FreeBSD
 
-```text
-/usr/local/sbin/ezfs2fa
-/usr/local/libexec/ezfs2fa/ezfs2fa.py
-/usr/local/libexec/ezfs2fa/ezfs2fa_lib/*.py
-/etc/ezfs2fa.json
-/usr/local/share/doc/ezfs2fa/README.md
-/usr/local/share/man/man8/ezfs2fa.8.gz
-```
+- `/usr/local/sbin/ezfs2fa`
+- `/usr/local/libexec/ezfs2fa/ezfs2fa.py`
+- `/usr/local/libexec/ezfs2fa/ezfs2fa_lib/*.py`
+- `/usr/local/etc/ezfs2fa.json`
+- `/usr/local/share/doc/ezfs2fa/README.md`
+- `/usr/local/man/man8/ezfs2fa.8.gz`
 
-The installed wrapper is OS-specific. The FreeBSD wrapper uses `/usr/local/etc/ezfs2fa.json`; the Linux wrapper uses `/etc/ezfs2fa.json`. Both pass arguments through unchanged.
+### Linux
+
+- `/usr/local/sbin/ezfs2fa`
+- `/usr/local/libexec/ezfs2fa/ezfs2fa.py`
+- `/usr/local/libexec/ezfs2fa/ezfs2fa_lib/*.py`
+- `/etc/ezfs2fa.json`
+- `/usr/local/share/doc/ezfs2fa/README.md`
+- `/usr/local/share/man/man8/ezfs2fa.8.gz`
 
 ## Install
 
@@ -378,16 +400,43 @@ ezfs2fa export-raw -o /mnt/offline/zroot-secure.rawkey
 
 For `unlock`, `lock`, `ensure`, `add`, and `export-raw`, `-d` is optional when the JSON configuration contains exactly one dataset. If there are zero or multiple datasets, the tool asks you to specify `-d DATASET`.
 
-## Modules
+## Main script and modules
 
-```text
-ezfs2fa.py                 command-line entry point
-ezfs2fa_lib/common.py      shared helpers and install-path detection
-ezfs2fa_lib/config.py      JSON config and strict schema validation
-ezfs2fa_lib/crypto.py      AES/HMAC wrapping helpers
-ezfs2fa_lib/fido.py        CLI FIDO manager
-ezfs2fa_lib/fido_cli.py    libfido2 command-line backend
-ezfs2fa_lib/fido_common.py FIDO metadata helpers
-ezfs2fa_lib/scratch.py     FreeBSD mdmfs / Linux ramfs scratch
-ezfs2fa_lib/zfsops.py      OpenZFS subprocess operations
-```
+Main script:
+
+- `ezfs2fa.py`                 command-line entry point
+
+Modules located in `ezfs2fa_lib/`:
+
+- `common.py`      shared helpers and install-path detection
+- `config.py`      JSON config and strict schema validation
+- `crypto.py`      AES/HMAC wrapping helpers
+- `fido.py`        CLI FIDO manager
+- `fido_cli.py`    libfido2 command-line backend
+- `fido_common.py` FIDO metadata helpers
+- `scratch.py`     FreeBSD mdmfs / Linux ramfs scratch
+- `zfsops.py`      OpenZFS subprocess operations
+
+---
+
+## Workflow diagrams
+
+Click on the ***Show: ... diagram*** section title to display the PlantUML workflow diagram.
+
+<details>
+<summary><strong>Show: create workflow diagram</strong></summary>
+<br>
+<img src="./docs/diags_svg/eZFS2FA+_workflow_create.svg" alt="Ceremony - key wrap">
+</details>
+
+<details>
+<summary><strong>Show: create with import workflow diagram</strong></summary>
+<br>
+<img src="./docs/diags_svg/eZFS2FA+_workflow_import+create.svg" alt="Ceremony - key wrap">
+</details>
+
+<details>
+<summary><strong>Show: unlock workflow diagram</strong></summary>
+<br>
+<img src="./docs/diags_svg/eZFS2FA+_workflow_unlock.svg" alt="Ceremony - key wrap">
+</details>

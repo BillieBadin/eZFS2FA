@@ -14,7 +14,7 @@ The core workflow is simple:
 6. The dataset mounts and the protected services can start.
 7. When finished, services can be stopped, the dataset unmounted, optionally snapshotted, and the ZFS key unloaded again.
 
-FreeBSD remains the first-class target. On FreeBSD, `ezfs2fa` uses OpenZFS native encryption and a volatile `mdmfs -M` scratch filesystem backed by malloc-backed `md(4)` memory. The raw ZFS key is written only as a short-lived 32-byte file inside that volatile scratch filesystem, passed to ZFS through a normal `file://` keylocation, wiped, unmounted, and destroyed. This avoids writing raw unlock material to `/tmp`, `/var/tmp`, `/var/run`, ordinary filesystems, flash storage, or swap-backed temporary storage.
+FreeBSD remains the first-class target. On FreeBSD, `ezfs2fa` uses OpenZFS native encryption and a volatile `mdmfs -M` scratch filesystem backed by malloc-backed `md(4)` memory. The raw ZFS key is written only as a short-lived 32-bytes file inside that volatile scratch filesystem, passed to ZFS through a normal `file://` keylocation, wiped, unmounted, and destroyed. This avoids writing raw unlock material to `/tmp`, `/var/tmp`, `/var/run`, ordinary filesystems, flash storage, or swap-backed temporary storage.
 
 The Linux path follows the same architecture with a Linux-native volatile scratch layer. Instead of FreeBSD `mdmfs -M`, Linux uses `ramfs` for the temporary key workspace. This keeps the user-facing workflow consistent while respecting each operating system’s native mechanisms. The result is a dual-stack design: FreeBSD at the front line, Linux-compatible where portability is useful.
 

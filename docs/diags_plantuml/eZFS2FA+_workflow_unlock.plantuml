@@ -1,0 +1,48 @@
+@startuml
+' eZFS2FA+ is a hardened encrypted ZFS dataset interactive workflow offering two-factor authentication for sensitive services on FreeBSD systems, with Linux compatibility built in.
+' SPDX-License-Identifier: MIT
+' SPDX-FileCopyrightText: 2026 Billie Badin, SIGORYX Engineering
+
+title eZFS2FA+ unlock workflow
+
+start
+:cmd_unlock();
+:require_root();
+:require_commands(["zfs"]);
+:cfg = ensure_config(path);
+:dataset = resolve_dataset(cfg, -d);
+:entry = dataset_entry(cfg, dataset);
+:rp_id resolution;
+:key_status = zfs get keystatus;
+
+if (key_status == "available") then (yes)
+    :already unlocked warning;
+elseif (key_status == "unavailable") then (yes)
+    :name, wrapper = choose_wrapper(...);
+    :raw_key = unwrap_key_record(wrapper,...);
+    :open ScratchSpace(dataset);
+    :scratch.write_key(raw_key);
+    :zfsops.load_key(... dry_run=True);
+    :zfsops.load_key(... dry_run=False);
+    :unlock success message;
+elseif (key_status == "none") then (yes)
+    :raise Error("dataset is not encrypted");
+    stop
+else
+    :raise Error("unexpected keystatus");
+    stop
+endif
+
+if (-N provided?) then (yes)
+    :skip mount;
+else (no)
+    :zfsops.mount_dataset(dataset);
+endif
+
+stop
+
+footer
+
+© 2026 Billie Badin, SIGORYX Engineering | MIT License | https://github.com/BillieBadin/eZFS2FA
+endfooter
+@enduml
