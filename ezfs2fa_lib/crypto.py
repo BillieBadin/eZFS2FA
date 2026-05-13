@@ -11,18 +11,21 @@ import base64
 import hashlib
 import hmac
 import secrets
-from   typing import Any, Dict, Optional, Tuple
+from   typing     import Any, Dict, Optional, Tuple
 
-from   .common import Error, WRAP_VERSION, ZFS_RAW_KEY_BYTES
+from   .common    import Error, WRAP_VERSION, ZFS_RAW_KEY_BYTES
 
 SCRYPT_N          = 1 << 15
 SCRYPT_R          = 8
 SCRYPT_P          = 3
 SCRYPT_DKLEN      = 64
 SCRYPT_SALT_BYTES = 16
+WRAP_KDF_DEFAULT  = "hkdf-sha512-v1"
+SecretKeyBytes    = bytearray           # ZFS raw key, passphrase, etc. (mutuatable for in-place wiping)
+ByteMaterial      = bytes | bytearray   # Non-secret binary payloads (iv/ciphertext/base64 material)
 
 # ------------------------------------------------------------------------------
-def b64e(data: bytes) -> str:
+def b64e(data: ByteMaterial) -> str:
     """Base64 encode bytes"""
     return base64.b64encode(data).decode("ascii")
 # ------------------------------------------------------------------------------
@@ -31,6 +34,18 @@ def b64e(data: bytes) -> str:
 def b64d(text: str) -> bytes:
     """Base64 decode bytes"""
     return base64.b64decode(text.encode("ascii"), validate=True)
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+def wipe_buffer(buffer: Optional[SecretKeyBytes]) -> None:
+    """
+    Best-effort in-place wipe for sensitive mutable buffers.
+    NOTE: Python and third-party libraries can still keep internal immutable
+    copies, so this is defense-in-depth and not a hard memory sanitization
+    guarantee.
+    """
+    if buffer is None: return
+    buffer[:] = b"\x00" * len(buffer)
 # ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
@@ -47,7 +62,10 @@ def default_kdf_params() -> Dict[str, Any]:
 # ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
-def _scrypt_material(passphrase: bytes, kdf_params: Dict[str, Any]) -> bytes:
+def _scrypt_material(
+    passphrase: SecretKeyBytes,
+    kdf_params: Dict[str, Any]
+) -> SecretKeyBytes:
     """Derive deterministic passphrase material using per-wrapper scrypt params"""
     if kdf_params.get("kdf_name") != "scrypt":
         raise Error(f"unsupported passphrase KDF: {kdf_params.get('kdf_name')}")
@@ -66,19 +84,86 @@ def _scrypt_material(passphrase: bytes, kdf_params: Dict[str, Any]) -> bytes:
     if r <= 0 or p <= 0 or dkln <= 0:
         raise Error("invalid KDF parameters (r, p, dklen must be > 0)")
     maxmem = (128 * n * r) + (128 * r * p) + 4096
-    return hashlib.scrypt(passphrase, salt=salt, n=n, r=r, p=p, dklen=dkln, maxmem=maxmem)
+    return bytearray(hashlib.scrypt(passphrase, salt=salt, n=n, r=r, p=p, dklen=dkln, maxmem=maxmem))
 # ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
-def derive_wrap_keys(fido_secret: Optional[bytes], passphrase: Optional[bytes], *, passphrase_enabled: bool, fido_enabled: bool, kdf_params: Optional[Dict[str, Any]]) -> Tuple[bytes, bytes]:
+def _hkdf_expand(
+    prk:     SecretKeyBytes,
+    info:    bytes,
+    out_len: int
+) -> SecretKeyBytes:
+    """HKDF-Expand using HMAC-SHA512"""
+    hash_len = hashlib.sha512().digest_size
+    if out_len <= 0:
+        raise Error("invalid HKDF output length")
+    if out_len > 255 * hash_len:
+        raise Error("HKDF output length too large")
+    output  = bytearray()
+    block   = b""
+    counter = 1
+    while len(output) < out_len:
+        block = hmac.new(bytes(prk), block + info + bytes([counter]), hashlib.sha512).digest()
+        output.extend(block)
+        counter += 1
+    return output[:out_len]
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+def _derive_wrap_keys_hkdf(
+    fido_secret:         SecretKeyBytes,
+    passphrase_material: SecretKeyBytes,
+    *,
+    passphrase_enabled:  bool,
+    fido_enabled:        bool,
+    kdf_name_bytes:      bytes,
+) -> Tuple[SecretKeyBytes, SecretKeyBytes]:
+    """HKDF-SHA-512 key derivation for wrapper encryption/MAC keys"""
+    salt = hashlib.sha512(
+        WRAP_VERSION.encode("ascii")
+        + b"\0wrap_kdf=" + WRAP_KDF_DEFAULT.encode("ascii")
+        + b"\0kdf_name=" + kdf_name_bytes
+    ).digest()
+    ikm = (
+        b"fido_secret=" + bytes(fido_secret)
+        + b"\0passphrase_material=" + bytes(passphrase_material)
+    )
+    info = (
+        b"ezfs2fa-wrap-keys"
+        + b"\0passphrase=" + (b"1" if passphrase_enabled else b"0")
+        + b"\0fido2="      + (b"1" if fido_enabled else b"0")
+        + b"\0kdf_name="   + kdf_name_bytes
+    )
+    prk = bytearray(hmac.new(salt, ikm, hashlib.sha512).digest())
+    try:
+        material = _hkdf_expand(prk, info, 64)
+        return material[:32], material[32:]
+    finally:
+        wipe_buffer(prk)
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+def derive_wrap_keys(
+    fido_secret:        Optional[SecretKeyBytes],
+    passphrase:         Optional[SecretKeyBytes],
+    *,
+    passphrase_enabled: bool,
+    fido_enabled:       bool,
+    kdf_params:         Optional[Dict[str, Any]],
+) -> Tuple[SecretKeyBytes, SecretKeyBytes]:
     """
     Derive AES and HMAC keys from enabled factors.
     Passphrase material is memory-hard via per-wrapper scrypt metadata.
     """
     if not passphrase_enabled and not fido_enabled:
         raise Error("at least one wrapping factor is required")
+    if fido_secret is not None and not isinstance(fido_secret, SecretKeyBytes):
+        raise Error("FIDO2 secret material must be a mutable bytearray")
+    if passphrase is not None and not isinstance(passphrase, SecretKeyBytes):
+        raise Error("passphrase material must be a mutable bytearray")
     if fido_enabled and fido_secret is None:
         raise Error("missing FIDO2 secret for wrapper that requires FIDO2")
+    passphrase_material: SecretKeyBytes = bytearray()
     if passphrase_enabled:
         if passphrase is None:
             raise Error("missing passphrase for wrapper that requires passphrase")
@@ -87,38 +172,56 @@ def derive_wrap_keys(fido_secret: Optional[bytes], passphrase: Optional[bytes], 
         passphrase_material = _scrypt_material(passphrase, kdf_params)
         kdf_name            = str(kdf_params.get("kdf_name", "unknown")).encode("ascii", "strict")
     else:
-        passphrase_material = b""
         kdf_name            = b"none"
-    material = hashlib.sha512(
-        WRAP_VERSION.encode("ascii")
-        + b"\0passphrase="  + (b"1" if passphrase_enabled else b"0")
-        + b"\0fido2="       + (b"1" if fido_enabled else b"0")
-        + b"\0kdf_name="    + kdf_name
-        + b"\0fido_secret=" + (fido_secret or b"")
-        + b"\0passphrase="  + passphrase_material
-    ).digest()
-    return material[:32], material[32:]
+    fido_material: SecretKeyBytes = fido_secret if fido_secret is not None else bytearray()
+    try:
+        return _derive_wrap_keys_hkdf(
+            fido_material,
+            passphrase_material,
+            passphrase_enabled = passphrase_enabled,
+            fido_enabled       = fido_enabled,
+            kdf_name_bytes     = kdf_name,
+        )
+    finally:
+        wipe_buffer(passphrase_material)
 # ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
-def aes_ctr(data: bytes, key: bytes, iv: bytes, decrypt: bool = False) -> bytes:
+def aes_ctr(
+    data:    ByteMaterial,
+    key:     SecretKeyBytes,
+    iv:      ByteMaterial,
+    decrypt: bool = False
+) -> bytes:
     """Encrypt/decrypt with in-process AES-256-CTR"""
+    if not isinstance(key, SecretKeyBytes):
+        raise Error("AES key must be a mutable bytearray")
     if len(key) != 32:
         raise Error("AES key must be 32 bytes")
-    if len(iv) != 16:
+    if len(iv)  != 16:
         raise Error("AES-CTR IV must be 16 bytes")
     try:
         from   cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     except ImportError as exc:
         raise Error("missing Python dependency: cryptography (required for in-process AES-CTR)") from exc
-    cipher = Cipher(algorithms.AES(key), modes.CTR(iv))
+    cipher = Cipher(algorithms.AES(bytes(key)), modes.CTR(bytes(iv)))
     ctx    = cipher.decryptor() if decrypt else cipher.encryptor()
-    return ctx.update(data) + ctx.finalize()
+    return ctx.update(bytes(data)) + ctx.finalize()
 # ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
-def tag_payload(mac_key: bytes, iv: bytes, ciphertext: bytes, *, passphrase_enabled: bool, fido_enabled: bool, kdf_name: str) -> bytes:
+def tag_payload(
+    mac_key:            SecretKeyBytes,
+    iv:                 ByteMaterial,
+    ciphertext:         ByteMaterial,
+    *,
+    passphrase_enabled: bool,
+    fido_enabled:       bool,
+    kdf_name:           str,
+) -> bytes:
     """Compute wrapper HMAC"""
+    if not isinstance(mac_key, SecretKeyBytes):
+        raise Error("HMAC key must be a mutable bytearray")
     if not kdf_name:
         raise Error("missing KDF name in wrapper metadata")
     data = (
@@ -126,14 +229,16 @@ def tag_payload(mac_key: bytes, iv: bytes, ciphertext: bytes, *, passphrase_enab
         + b"\0passphrase=" + (b"1" if passphrase_enabled else b"0")
         + b"\0fido2="      + (b"1" if fido_enabled else b"0")
         + b"\0kdf_name="   + kdf_name.encode("ascii")
-        + b"\0"            + iv + ciphertext
+        + b"\0"            + bytes(iv) + bytes(ciphertext)
     )
-    return hmac.new(mac_key, data, hashlib.sha256).digest()
+    return hmac.new(bytes(mac_key), data, hashlib.sha256).digest()
 # ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
-def validate_raw_key(key: bytes) -> None:
+def validate_raw_key(key: SecretKeyBytes) -> None:
     """Require an OpenZFS raw 256-bit key"""
+    if not isinstance(key, SecretKeyBytes):
+        raise Error("raw ZFS key must be a mutable bytearray")
     if len(key) != ZFS_RAW_KEY_BYTES:
         raise Error(f"raw ZFS key must be exactly {ZFS_RAW_KEY_BYTES} bytes")
 # ------------------------------------------------------------------------------
