@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 Billie Badin, SIGORYX Engineering
 """
-Current-version wrapper create/unwrap logic.
-Backward-compatibility unwrap for previous version is in wrapper_upgrade.py.
+Key wrap and unwrap logic.
+Backward-compatibility for previous versions is in wrapper_upgrade.py only;
+the configuration needs to be upgraded first, this code shall never see any old wrappers.
 """
 
 from   __future__ import annotations
@@ -15,6 +16,7 @@ from   typing     import Any, Dict, Optional
 
 from   .common    import Error, WRAP_VERSION, now_utc
 from   .crypto    import (
+    SecretKeyBytes,
     WRAP_KDF_DEFAULT,
     aes_ctr, b64d, b64e,
     default_kdf_params, derive_wrap_keys,
@@ -23,7 +25,7 @@ from   .crypto    import (
 from   .fido      import FidoManager
 
 # ------------------------------------------------------------------------------
-def _prompt_passphrase(confirm: bool = False) -> bytearray:
+def _prompt_passphrase(confirm: bool = False) -> SecretKeyBytes:
     """Prompt for a non-empty wrapping passphrase"""
     first = getpass.getpass("Wrapping passphrase: ")
     if not first:
@@ -38,7 +40,7 @@ def _prompt_passphrase(confirm: bool = False) -> bytearray:
 
 # ------------------------------------------------------------------------------
 def wrap_key_record(
-    raw_key:        bytearray,
+    raw_key:        SecretKeyBytes,
     *,
     name:           str,
     rp_id:          str,
@@ -48,14 +50,12 @@ def wrap_key_record(
     fido_device:    Optional[str]
 ) -> Dict[str, Any]:
     """Create a wrapped-key JSON record"""
-    if not isinstance(raw_key, bytearray):
-        raise Error("raw_key must be a mutable bytearray")
     validate_raw_key(raw_key)
-    fido_record: Dict[str, Any]          = {}
-    fido_secret: Optional[bytearray]     = None
-    passphrase: Optional[bytearray]      = None
-    aes_key: Optional[bytearray]         = None
-    mac_key: Optional[bytearray]         = None
+    fido_record: Dict[str, Any]           = {}
+    fido_secret: Optional[SecretKeyBytes] = None
+    passphrase:  Optional[SecretKeyBytes] = None
+    aes_key:     Optional[SecretKeyBytes] = None
+    mac_key:     Optional[SecretKeyBytes] = None
     try:
         if use_fido:
             manager     = FidoManager(cfg)
@@ -125,7 +125,7 @@ def unwrap_key_record(
     rp_id:       str,
     cfg:         Dict[str, Any],
     fido_device: Optional[str]
-) -> bytearray:
+) -> SecretKeyBytes:
     """Unwrap one current-version JSON wrapper into the raw ZFS key"""
     wrapper_version = wrapper.get("wrap_version")
     if wrapper_version != WRAP_VERSION:
@@ -137,10 +137,10 @@ def unwrap_key_record(
     use_fido       = bool(wrapper.get("fido2", False))
     if not use_passphrase and not use_fido:
         raise Error("wrapper has neither passphrase nor fido2 enabled")
-    fido_secret: Optional[bytearray] = None
-    passphrase: Optional[bytearray]  = None
-    aes_key: Optional[bytearray]     = None
-    mac_key: Optional[bytearray]     = None
+    fido_secret: Optional[SecretKeyBytes] = None
+    passphrase:  Optional[SecretKeyBytes] = None
+    aes_key:     Optional[SecretKeyBytes] = None
+    mac_key:     Optional[SecretKeyBytes] = None
     try:
         if use_fido:
             fido_secret = bytearray(FidoManager(cfg).hmac_secret(wrapper=wrapper, rp_id=rp_id, device=fido_device))
