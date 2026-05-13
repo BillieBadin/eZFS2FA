@@ -9,12 +9,12 @@ from   __future__ import annotations
 
 import base64
 import os
+import re
 import secrets
 import subprocess
 from   typing import Any, Dict, List, Optional
 
 from   .common import Error, eprint, require_commands
-from   .crypto import b64e
 from   .fido_common import FidoDeviceInfo, choose_from_devices, freebsd_uhid_candidates, ykman_serial_if_single
 from   .scratch import ScratchSpace
 
@@ -46,6 +46,140 @@ def _write_private(path: str, data: bytes) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.chmod(path, 0o600)
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+def _extract_b64_tokens(text: str) -> List[str]:
+    """Return unique base64 candidates from text"""
+    tokens: List[str] = []
+    seen = set()
+    for token in re.findall(r"[A-Za-z0-9+/=]+", text):
+        if token in seen:
+            continue
+        try:
+            base64.b64decode(token.encode("ascii"), validate=True)
+        except Exception:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return tokens
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+def _parse_field_candidates(output: bytes) -> List[tuple[str, str]]:
+    """Extract (field, b64-token) candidates from textual fido2 output"""
+    pairs: List[tuple[str, str]] = []
+    for raw in output.decode("utf-8", "replace").splitlines():
+        line  = raw.strip()
+        if not line:
+            continue
+        field = ""
+        value = line
+        for separator in [":", "="]:
+            if separator in line:
+                head, tail = line.split(separator, 1)
+                field = head.strip().lower().replace("_", " ").replace("-", " ")
+                value = tail.strip()
+                break
+        for token in _extract_b64_tokens(value):
+            pairs.append((field, token))
+    return pairs
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+def _pick_base64_field(
+    output:         bytes,
+    *,
+    context:        str,
+    required_terms: List[str],
+    exact_len:      Optional[int] = None,
+    min_len:        int = 1,
+) -> str:
+    """Pick one validated base64 field by name, with strict ambiguity checks"""
+    pairs = _parse_field_candidates(output)
+    named: List[str] = []
+    for field, token in pairs:
+        if field and all(term in field for term in required_terms):
+            named.append(token)
+    source = named if named else [token for _, token in pairs]
+    accepted: List[str] = []
+    for token in source:
+        try:
+            decoded = base64.b64decode(token.encode("ascii"), validate=True)
+        except Exception:
+            continue
+        if exact_len is not None and len(decoded) != exact_len:
+            continue
+        if len(decoded) < min_len:
+            continue
+        if token not in accepted:
+            accepted.append(token)
+    if len(accepted) == 1:
+        return accepted[0]
+    if len(accepted) == 0:
+        raise Error(f"unexpected {context} output: required base64 field not found")
+    raise Error(f"unexpected {context} output: ambiguous base64 field parse")
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+def _parse_credential_id_b64(output: bytes) -> str:
+    """Extract credential_id_b64 from fido2-cred output"""
+    try:
+        token = _pick_base64_field(
+            output,
+            context        = "fido2-cred",
+            required_terms = ["credential", "id"],
+            min_len        = 16,
+        )
+    except Error:
+        # libfido2 textual output can be positional on some versions. Keep this
+        # fallback explicit and validated to avoid silent corruption.
+        lines = [line.strip() for line in output.decode("utf-8", "replace").splitlines() if line.strip()]
+        positional = []
+        for line in lines:
+            tokens = _extract_b64_tokens(line)
+            if len(tokens) == 1 and tokens[0] == line:
+                positional.append(tokens[0])
+        if len(positional) < 5:
+            raise Error("unexpected fido2-cred output: cannot extract credential id")
+        token = positional[4]
+        decoded = base64.b64decode(token.encode("ascii"), validate=True)
+        if len(decoded) < 16:
+            raise Error("unexpected fido2-cred output: credential id is too short")
+    try:
+        base64.b64decode(token.encode("ascii"), validate=True)
+    except Exception as exc:
+        raise Error(f"fido2-cred returned invalid credential id base64: {exc}") from exc
+    return token
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+def _parse_hmac_secret(output: bytes) -> bytes:
+    """Extract and decode hmac-secret from fido2-assert output"""
+    try:
+        token = _pick_base64_field(
+            output,
+            context        = "fido2-assert",
+            required_terms = ["hmac", "secret"],
+            exact_len      = 32,
+        )
+    except Error:
+        lines = [line.strip() for line in output.decode("utf-8", "replace").splitlines() if line.strip()]
+        positional = []
+        for line in lines:
+            tokens = _extract_b64_tokens(line)
+            if len(tokens) == 1 and tokens[0] == line:
+                positional.append(tokens[0])
+        if not positional:
+            raise Error("unexpected fido2-assert output: hmac-secret field not found")
+        token = positional[-1]
+    try:
+        secret = base64.b64decode(token.encode("ascii"), validate=True)
+    except Exception as exc:
+        raise Error(f"fido2-assert returned invalid hmac-secret base64: {exc}") from exc
+    if len(secret) != 32:
+        raise Error(f"fido2-assert hmac-secret must be 32 bytes, got {len(secret)}")
+    return secret
 # ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
@@ -161,32 +295,28 @@ class CliFidoBackend:
         # FreeBSD/libfido2 command-line tools are more reliable with explicit
         # -i/-o files than with stdin/stdout. Use mdmfs -M scratch storage so
         # credential material and assertion output do not touch persistent
-        # storage. Credential output is later stored intentionally in JSON.
+        # storage.
         with ScratchSpace("fido-cred") as scratch:
             if scratch.mountpoint is None:
                 raise Error("FIDO scratch filesystem is not mounted")
             in_path  = str(scratch.mountpoint / "cred.in")
             out_path = str(scratch.mountpoint / "cred.out")
             _write_private(in_path, cred_input)
-            proc     = subprocess.run(["fido2-cred", "-M", "-h", "-v", "-i", in_path, "-o", out_path, dev.path])
-            if proc.returncode != 0:
-                raise Error("fido2-cred failed. If the key flashes, touch it after entering the PIN.")
+            output   = b""
             try:
+                proc = subprocess.run(["fido2-cred", "-M", "-h", "-v", "-i", in_path, "-o", out_path, dev.path])
+                if proc.returncode != 0:
+                    raise Error("fido2-cred failed. If the key flashes, touch it after entering the PIN.")
                 with open(out_path, "rb") as handle:
                     output = handle.read()
             finally:
                 _wipe_file(in_path)
                 _wipe_file(out_path)
-        lines = [line for line in output.splitlines() if line.strip()]
-        if len(lines) < 5:
-            raise Error("unexpected fido2-cred output; cannot extract credential id")
-        credential_id = lines[4].decode("ascii")
+        credential_id = _parse_credential_id_b64(output)
         return {
-            "backend":               self.name,
-            "credential_input_b64":  b64e(cred_input),
-            "credential_output_b64": b64e(output),
-            "credential_id_b64":     credential_id,
-            "device":                dev.to_json(),
+            "backend":           self.name,
+            "credential_id_b64": credential_id,
+            "device":            dev.to_json(),
         }
     # --------------------------------------------------------------------------
 
@@ -208,18 +338,15 @@ class CliFidoBackend:
             in_path  = str(scratch.mountpoint / "assert.in")
             out_path = str(scratch.mountpoint / "assert.out")
             _write_private(in_path, assert_input)
-            proc = subprocess.run(["fido2-assert", "-G", "-h", "-v", "-i", in_path, "-o", out_path, dev.path])
-# ------------------------------------------------------------------------------
-            if proc.returncode != 0:
-                raise Error("fido2-assert failed. If the key flashes, touch it after entering the PIN.")
+            output = b""
             try:
+                proc = subprocess.run(["fido2-assert", "-G", "-h", "-v", "-i", in_path, "-o", out_path, dev.path])
+                if proc.returncode != 0:
+                    raise Error("fido2-assert failed. If the key flashes, touch it after entering the PIN.")
                 with open(out_path, "rb") as handle:
                     output = handle.read()
             finally:
                 _wipe_file(in_path)
                 _wipe_file(out_path)
-        lines = [line.strip() for line in output.splitlines() if line.strip()]
-        if not lines:
-            raise Error("fido2-assert produced no output")
-        return base64.b64decode(lines[-1], validate=True)
+        return _parse_hmac_secret(output)
     # --------------------------------------------------------------------------
