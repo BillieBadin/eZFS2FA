@@ -245,8 +245,8 @@ Run:
 ezfs2fa doctor
 ```
 
-It reports the OS, config path, scratch backend, required commands, dataset count, and visible FIDO devices.
-It also reports whether Python `cryptography` is available for in-process AES-CTR.
+Report the OS, config path, scratch backend, required commands, imported/importable zpool state, dataset count, and visible FIDO devices.
+Also report whether Python `cryptography` is available for in-process AES-CTR.
 
 ## Basic commands
 
@@ -258,9 +258,9 @@ ezfs2fa init
 
 `init` is protected: if the config already contains datasets/wrappers, it exits with a warning instead of reinitialising.
 
-If a previous `create` or `create --migrate` was interrupted after staging a pending operation, mutating commands are blocked until pending state is resolved with `recover-pending`.
+If a previous `create` or `create --migrate` was interrupted after staging a pending operation, mutating commands are blocked until pending state is resolved with `recover-pending` (or forcibly cleared with `--cancel-pending`).
 
-List configured datasets and wrappers:
+List configured datasets and wrappers (and current imported/importable zpools):
 
 ```sh
 ezfs2fa list
@@ -317,6 +317,12 @@ Drop stale pending state without finalizing dataset entry:
 
 ```sh
 ezfs2fa recover-pending --drop
+```
+
+Force-clear pending operation state before any command:
+
+```sh
+ezfs2fa --cancel-pending list
 ```
 
 Unlock the only configured dataset:
