@@ -10,10 +10,11 @@ from   __future__ import annotations
 import json
 import os
 import tempfile
-from   pathlib import Path
-from   typing import Any, Dict, Optional
+from   pathlib    import Path
+from   typing     import Any, Dict, Optional
 
-from   .common import Error, VERSION, chmod_private, now_utc
+from   .common    import Error, VERSION, WRAP_VERSION, chmod_private, now_utc
+from   .crypto    import WRAP_KDF_DEFAULT
 
 REQUIRED_WRAPPER_FIELDS = {
     "wrap_version",
@@ -69,6 +70,12 @@ def validate_wrapper(name: str, dataset: str, wrapper: Dict[str, Any]) -> None:
         value = wrapper.get(key)
         if not isinstance(value, str) or not value:
             raise Error(f"invalid config: wrapper '{name}' in '{dataset}' field '{key}' must be a non-empty string")
+    if wrapper.get("wrap_version") == WRAP_VERSION:
+        if wrapper.get("wrap_kdf") != WRAP_KDF_DEFAULT:
+            raise Error(
+                f"invalid config: wrapper '{name}' in '{dataset}' has unsupported wrap_kdf "
+                f"for {WRAP_VERSION}: {wrapper.get('wrap_kdf')!r}"
+            )
     for key in ["passphrase", "fido2"]:
         if not isinstance(wrapper.get(key), bool):
             raise Error(f"invalid config: wrapper '{name}' in '{dataset}' field '{key}' must be boolean")
