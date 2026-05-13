@@ -7,6 +7,9 @@ OpenZFS subprocess operations
 
 from   __future__ import annotations
 
+import subprocess
+import sys
+import time
 from   datetime   import datetime, timezone
 from   pathlib    import Path
 from   typing     import Dict, List, Optional
@@ -183,6 +186,15 @@ def change_key(dataset: str, key_path: Path) -> None:
 # ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
+def ensure_keylocation_prompt(dataset: str) -> None:
+    """Force keylocation=prompt when dataset holds a stale file:// path"""
+    require_commands(["zfs"])
+    current = zfs_get(dataset, "keylocation")
+    if current in {"prompt", "-", "none"}: return
+    run(["zfs", "set", "keylocation=prompt", dataset], capture=True)
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
 def mount_dataset(dataset: str) -> None:
     """Mount dataset if needed"""
     if zfs_get(dataset, "mounted") != "yes":
@@ -199,9 +211,6 @@ def unload_key(dataset: str) -> None:
 # ------------------------------------------------------------------------------
 def unmount_dataset(dataset: str, *, force_delay: Optional[int] = None) -> None:
     """Unmount dataset, optionally forcing after a delay"""
-    import subprocess
-    import sys
-    import time
     if   zfs_get(dataset, "mounted") != "yes": return
     proc = subprocess.run(["zfs", "unmount", dataset])
     if   proc.returncode == 0: return
