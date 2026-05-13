@@ -10,7 +10,6 @@ ezfs2fa: FreeBSD/Linux OpenZFS dataset unlock with passphrase and/or FIDO2
 from   __future__          import annotations
 
 import argparse
-import getpass
 import hashlib
 import os
 import platform
@@ -24,7 +23,7 @@ from   typing              import Any, Dict, List, Optional, Set
 
 # eZFS2FA+ libraries
 from   ezfs2fa_lib.common  import (
-    VERSION, WRAP_VERSION, ZFS_RAW_KEY_BYTES,
+    VERSION, ZFS_RAW_KEY_BYTES,
     Error,
     default_config_path,
     eprint, now_utc, safe_name,
@@ -32,26 +31,15 @@ from   ezfs2fa_lib.common  import (
     require_commands, require_root,
 )
 from   ezfs2fa_lib.config  import dataset_entry, ensure_config, resolve_dataset, save_config
-from   ezfs2fa_lib.crypto  import aes_ctr, b64d, b64e, default_kdf_params, derive_wrap_keys, tag_payload, validate_raw_key
+from   ezfs2fa_lib.crypto  import wipe_buffer
 from   ezfs2fa_lib.fido    import FidoManager
+from   ezfs2fa_lib.key_wrap import wrap_key_record, unwrap_key_record
 from   ezfs2fa_lib.scratch import ScratchSpace
+from   ezfs2fa_lib.wrapper_upgrade import cmd_upgrade_wrappers
 from   ezfs2fa_lib         import zfsops
 
 
 DEFAULT_CONFIG = str(default_config_path(__file__))
-
-# ------------------------------------------------------------------------------
-def prompt_passphrase(confirm: bool = False) -> bytes:
-    """Prompt for a non-empty wrapping passphrase"""
-    first = getpass.getpass("Wrapping passphrase: ")
-    if not first:
-        raise Error("empty wrapping passphrase refused")
-    if confirm:
-        second = getpass.getpass("Repeat wrapping passphrase: ")
-        if first != second:
-            raise Error("passphrases do not match")
-    return first.encode("utf-8")
-# ------------------------------------------------------------------------------
 
 
 # ------------------------------------------------------------------------------
@@ -68,131 +56,6 @@ def resolve_auth_flags(
     if not use_passphrase and not use_fido:
         raise Error("at least one factor is required: --passphrase/--pass or --fido")
     return use_passphrase, use_fido
-# ------------------------------------------------------------------------------
-
-
-# ------------------------------------------------------------------------------
-def wrap_key_record(
-    raw_key:        bytes,
-    *,
-    name:           str,
-    rp_id:          str,
-    cfg:            Dict[str, Any],
-    use_passphrase: bool,
-    use_fido:       bool,
-    fido_device:    Optional[str]
-) -> Dict[str, Any]:
-    """Create a wrapped-key JSON record"""
-    validate_raw_key(raw_key)
-    fido_record: Dict[str, Any]  = {}
-    fido_secret: Optional[bytes] = None
-    if use_fido:
-        manager     = FidoManager(cfg)
-        fido_record = manager.make_credential(name=name, rp_id=rp_id, device=fido_device)
-        hmac_salt   = secrets.token_bytes(32)
-        fido_record["hmac_salt_b64"] = b64e(hmac_salt)
-        fido_secret = manager.hmac_secret(wrapper=fido_record, rp_id=rp_id, device=fido_device)
-    passphrase       = prompt_passphrase(confirm=True) if use_passphrase else None
-    kdf_params       = default_kdf_params() if use_passphrase else {"kdf_name": "none"}
-    aes_key, mac_key = derive_wrap_keys(
-        fido_secret,
-        passphrase,
-        passphrase_enabled = use_passphrase,
-        fido_enabled       = use_fido,
-        kdf_params         = kdf_params,
-    )
-    iv               = secrets.token_bytes(16)
-    ciphertext       = aes_ctr(raw_key, aes_key, iv, decrypt=False)
-    tag              = tag_payload(
-        mac_key,
-        iv,
-        ciphertext,
-        passphrase_enabled = use_passphrase,
-        fido_enabled       = use_fido,
-        kdf_name           = str(kdf_params["kdf_name"]),
-    )
-    record = {
-        "name":            name,
-        "created_at":      now_utc(),
-        "last_export_at":  None,
-        "rp_id":           rp_id,
-        "passphrase":      use_passphrase,
-        "fido2":           use_fido,
-        "wrap_version":    WRAP_VERSION,
-        "iv_b64":          b64e(iv),
-        "wrapped_key_b64": b64e(ciphertext),
-        "tag_b64":         b64e(tag),
-        "kdf_name":        kdf_params["kdf_name"],
-        "kdf_salt_b64":    kdf_params.get("kdf_salt_b64"),
-        "kdf_n":           kdf_params.get("kdf_n"),
-        "kdf_r":           kdf_params.get("kdf_r"),
-        "kdf_p":           kdf_params.get("kdf_p"),
-        "kdf_dklen":       kdf_params.get("kdf_dklen"),
-        "cipher":          "AES-256-CTR",
-        "mac":             "HMAC-SHA256",
-        "auth": {
-            "passphrase":  use_passphrase,
-            "fido2":       use_fido,
-        },
-    }
-    if use_fido:
-        record.update(fido_record)
-    return record
-# ------------------------------------------------------------------------------
-
-
-# ------------------------------------------------------------------------------
-def unwrap_key_record(
-    wrapper:     Dict[str, Any],
-    *,
-    rp_id:       str,
-    cfg:         Dict[str, Any],
-    fido_device: Optional[str]
-) -> bytes:
-    """Unwrap one JSON wrapper into the raw ZFS key"""
-    wrapper_version = wrapper.get("wrap_version")
-    if wrapper_version != WRAP_VERSION:
-        raise Error(f"unsupported wrapper version: {wrapper_version}; expected {WRAP_VERSION}")
-    use_passphrase = bool(wrapper.get("passphrase", False))
-    use_fido       = bool(wrapper.get("fido2", False))
-    if not use_passphrase and not use_fido:
-        raise Error("wrapper has neither passphrase nor fido2 enabled")
-    fido_secret: Optional[bytes] = None
-    if use_fido:
-        fido_secret = FidoManager(cfg).hmac_secret(wrapper=wrapper, rp_id=rp_id, device=fido_device)
-    passphrase       = prompt_passphrase(confirm=False) if use_passphrase else None
-    kdf_params       = {
-        "kdf_name":     wrapper.get("kdf_name"),
-        "kdf_salt_b64": wrapper.get("kdf_salt_b64"),
-        "kdf_n":        wrapper.get("kdf_n"),
-        "kdf_r":        wrapper.get("kdf_r"),
-        "kdf_p":        wrapper.get("kdf_p"),
-        "kdf_dklen":    wrapper.get("kdf_dklen"),
-    }
-    aes_key, mac_key = derive_wrap_keys(
-        fido_secret,
-        passphrase,
-        passphrase_enabled = use_passphrase,
-        fido_enabled       = use_fido,
-        kdf_params         = kdf_params,
-    )
-    iv               = b64d(wrapper["iv_b64"])
-    ciphertext       = b64d(wrapper["wrapped_key_b64"])
-    expected         = b64d(wrapper["tag_b64"])
-    actual           = tag_payload(
-        mac_key,
-        iv,
-        ciphertext,
-        passphrase_enabled = use_passphrase,
-        fido_enabled       = use_fido,
-        kdf_name           = str(wrapper.get("kdf_name", "")),
-    )
-    import hmac as hmac_module
-    if not hmac_module.compare_digest(expected, actual):
-        raise Error("wrapped-key HMAC verification failed; wrong factor, wrong passphrase, or corrupt JSON")
-    raw_key = aes_ctr(ciphertext, aes_key, iv, decrypt=True)
-    validate_raw_key(raw_key)
-    return raw_key
 # ------------------------------------------------------------------------------
 
 
@@ -594,11 +457,15 @@ def cmd_mkmd(args: argparse.Namespace) -> None:
     """Create diagnostic scratch filesystem"""
     require_root()
     with ScratchSpace(args.n or "test") as scratch:
-        scratch.write_key(secrets.token_bytes(ZFS_RAW_KEY_BYTES))
-        print(str(scratch.path))
-        eprint(f"key file: {scratch.key_path()}")
-        eprint("Press Enter to destroy scratch filesystem.")
-        input()
+        raw_key = bytearray(secrets.token_bytes(ZFS_RAW_KEY_BYTES))
+        try:
+            scratch.write_key(raw_key)
+            print(str(scratch.path))
+            eprint(f"key file: {scratch.key_path()}")
+            eprint("Press Enter to destroy scratch filesystem.")
+            input()
+        finally:
+            wipe_buffer(raw_key) # always wipe key from memory no matter what
 # ------------------------------------------------------------------------------
 
 
@@ -658,34 +525,38 @@ def cmd_create(args: argparse.Namespace) -> None:
     if not args.y and not prompt_confirm("Continue"):
         raise Error("cancelled")
     with ScratchSpace(safe_name(dataset)) as scratch:
-        raw_key = secrets.token_bytes(ZFS_RAW_KEY_BYTES)
-        entry = {
-            "dataset":    dataset,
-            "mountpoint": mountpoint,
-            "rp_id":      rp_id,
-            "canmount":   canmount,
-            "created_at": now_utc(),
-            "wrappers":   {},
-        }
-        entry["wrappers"][name] = wrap_key_record(raw_key, name=name, rp_id=rp_id, cfg=cfg, use_passphrase=use_passphrase, use_fido=use_fido, fido_device=args.D)
-        while args.a or prompt_confirm("Enrol another wrapper now"):
-            args.a   = False
-            new_name = safe_name(prompt_value("New wrapper name"))
-            new_passphrase, new_fido = resolve_auth_flags(args, prompt=True)
-            if new_name in entry["wrappers"]:
-                raise Error(f"duplicate wrapper name: {new_name}")
-            entry["wrappers"][new_name] = wrap_key_record(raw_key, name=new_name, rp_id=rp_id, cfg=cfg, use_passphrase=new_passphrase, use_fido=new_fido, fido_device=args.D)
-        pending_id = start_pending_op(cfg_path, cfg, operation="migrate" if migrating else "create", dataset=dataset, entry=entry)
-        scratch.write_key(raw_key)
-        if migrating:
-            zfsops.change_key(dataset, scratch.key_path())
-        else:
-            zfsops.create_dataset(dataset, mountpoint, canmount, scratch.key_path())
-        cfg["datasets"][dataset] = entry
-        clear_pending_op(cfg, expected_id=pending_id)
-        save_config(cfg_path, cfg)
-        if not migrating:
-            zfsops.mount_dataset(dataset)
+        raw_key = bytearray(secrets.token_bytes(ZFS_RAW_KEY_BYTES))
+        try:
+            entry = {
+                "dataset":    dataset,
+                "mountpoint": mountpoint,
+                "rp_id":      rp_id,
+                "canmount":   canmount,
+                "created_at": now_utc(),
+                "wrappers":   {},
+            }
+            entry["wrappers"][name] = wrap_key_record(raw_key, name=name, rp_id=rp_id, cfg=cfg, use_passphrase=use_passphrase, use_fido=use_fido, fido_device=args.D)
+            auto_add = bool(args.a)
+            while auto_add or prompt_confirm("Enrol another wrapper now"):
+                auto_add = False
+                new_name = safe_name(prompt_value("New wrapper name"))
+                new_passphrase, new_fido = resolve_auth_flags(args, prompt=True)
+                if new_name in entry["wrappers"]:
+                    raise Error(f"duplicate wrapper name: {new_name}")
+                entry["wrappers"][new_name] = wrap_key_record(raw_key, name=new_name, rp_id=rp_id, cfg=cfg, use_passphrase=new_passphrase, use_fido=new_fido, fido_device=args.D)
+            pending_id = start_pending_op(cfg_path, cfg, operation="migrate" if migrating else "create", dataset=dataset, entry=entry)
+            scratch.write_key(raw_key)
+            if migrating:
+                zfsops.change_key(dataset, scratch.key_path())
+            else:
+                zfsops.create_dataset(dataset, mountpoint, canmount, scratch.key_path())
+            cfg["datasets"][dataset] = entry
+            clear_pending_op(cfg, expected_id=pending_id)
+            save_config(cfg_path, cfg)
+            if not migrating:
+                zfsops.mount_dataset(dataset)
+        finally:
+            wipe_buffer(raw_key) # always wipe key from memory no matter what
     if migrating:
         print(f"Migrated dataset and updated config: {cfg_path}")
     else:
@@ -705,16 +576,20 @@ def cmd_unlock(args: argparse.Namespace) -> None:
     dataset    = resolve_dataset(cfg, args.d)
     entry      = dataset_entry(cfg, dataset)
     rp_id      = args.r or entry.get("rp_id", "zfs.local")
+    zfsops.ensure_keylocation_prompt(dataset)
     key_status = zfsops.zfs_get(dataset, "keystatus")
     if   key_status == "available":
         eprint(f"ZFS key already loaded for {dataset}")
     elif key_status == "unavailable":
         name, wrapper = choose_wrapper(entry, args.n)
-        raw_key       = unwrap_key_record(wrapper, rp_id=rp_id, cfg=cfg, fido_device=args.D)
-        with ScratchSpace(safe_name(dataset)) as scratch:
-            scratch.write_key(raw_key)
-            zfsops.load_key(dataset, scratch.key_path(), dry_run=True)
-            zfsops.load_key(dataset, scratch.key_path(), dry_run=False)
+        raw_key = unwrap_key_record(wrapper, rp_id=rp_id, cfg=cfg, fido_device=args.D)
+        try:
+            with ScratchSpace(safe_name(dataset)) as scratch:
+                scratch.write_key(raw_key)
+                zfsops.load_key(dataset, scratch.key_path(), dry_run=True)
+                zfsops.load_key(dataset, scratch.key_path(), dry_run=False)
+        finally:
+            wipe_buffer(raw_key)
         eprint(f"Unlocked {dataset} using wrapper '{name}'")
     elif key_status == "none":
         raise Error(f"dataset is not encrypted: {dataset}")
@@ -739,8 +614,11 @@ def cmd_add(args: argparse.Namespace) -> None:
         raise Error(f"wrapper already exists: {new_name}. Use -f to replace it.")
     use_passphrase, use_fido = resolve_auth_flags(args, prompt=True)
     rp_id    = args.r or entry.get("rp_id", "zfs.local")
-    raw_key  = unwrap_key_record(old_wrapper, rp_id=rp_id, cfg=cfg, fido_device=args.X)
-    entry["wrappers"][new_name] = wrap_key_record(raw_key, name=new_name, rp_id=rp_id, cfg=cfg, use_passphrase=use_passphrase, use_fido=use_fido, fido_device=args.Y)
+    raw_key  = unwrap_key_record(old_wrapper, rp_id=rp_id, cfg=cfg, fido_device=args.old_fido_device)
+    try:
+        entry["wrappers"][new_name] = wrap_key_record(raw_key, name=new_name, rp_id=rp_id, cfg=cfg, use_passphrase=use_passphrase, use_fido=use_fido, fido_device=args.new_fido_device)
+    finally:
+        wipe_buffer(raw_key)
     save_config(cfg_path, cfg)
     print(f"Added wrapper '{new_name}' to {dataset} using existing wrapper '{old_name}'")
     eprint("IMPORTANT: Back up the JSON config again because a new wrapper was added.")
@@ -816,7 +694,7 @@ def cmd_pack(args: argparse.Namespace) -> None:
     os.chmod(out, 0o600)
     cfg.setdefault("backup_evidence", {})["last_pack_at"] = now_utc()
     save_config(cfg_path, cfg)
-    print(f"Packed JSON config to: {out}")
+    print(f"Packed JSON config (UNENCRYPTED archive) to: {out}")
 # ------------------------------------------------------------------------------
 
 
@@ -836,10 +714,13 @@ def cmd_export_raw(args: argparse.Namespace) -> None:
     if not args.y and not prompt_confirm("This writes the raw ZFS key to a file. Continue"):
         raise Error("cancelled")
     out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("wb") as handle:
-        handle.write(raw_key)
-        handle.flush()
-        os.fsync(handle.fileno())
+    try:
+        with out.open("wb") as handle:
+            handle.write(raw_key)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        wipe_buffer(raw_key)
     os.chmod(out, 0o600)
     cfg.setdefault("backup_evidence", {})["last_export_raw_at"] = now_utc()
     save_config(cfg_path, cfg)
@@ -887,6 +768,9 @@ def cmd_recover_pending(args: argparse.Namespace) -> None:
         raise Error(f"pending recovery refused: dataset not found on host: {dataset}")
     if dataset_live.get("encryption", "") == "off":
         raise Error(f"pending recovery refused: dataset is not encrypted: {dataset}")
+    # A crash between create/change-key and keylocation reset can leave a stale
+    # file:// path; always normalize this during journal recovery.
+    zfsops.ensure_keylocation_prompt(dataset)
     if dataset in cfg.get("datasets", {}) and not args.f:
         raise Error(f"dataset already exists in config: {dataset}. Use -f to replace it from pending state.")
     cfg.setdefault("datasets", {})[dataset] = entry
@@ -965,8 +849,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", help="old wrapper name used to unwrap")
     p.add_argument("-n", help="new wrapper name")
     p.add_argument("-r", help="override relying party id")
-    p.add_argument("-X", help="old FIDO2 device path")
-    p.add_argument("-Y", help="new FIDO2 device path")
+    p.add_argument(
+        "-X", "--old-fido-device",
+        dest="old_fido_device",
+        metavar="DEV",
+        help="FIDO2 device path used to authenticate the existing wrapper",
+    )
+    p.add_argument(
+        "-Y", "--new-fido-device",
+        dest="new_fido_device",
+        metavar="DEV",
+        help="FIDO2 device path used to enrol the new wrapper",
+    )
     p.add_argument("--passphrase", "--pass", action="store_true", dest="passphrase", help="protect wrapper with passphrase")
     p.add_argument("--fido", action="store_true", help="protect wrapper with FIDO2 hmac-secret")
     p.add_argument("-f", action="store_true", help="replace existing new wrapper name")
@@ -995,6 +889,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", required=True, help="output tar.gz path")
     p.add_argument("-f", action="store_true", help="overwrite output")
     p.set_defaults(func=cmd_pack)
+
+    p = sub.add_parser("upgrade-wrappers", help="upgrade legacy wrapper records to current wrapper version")
+    p.add_argument("-d", help="dataset")
+    p.add_argument("-n", help="wrapper name (requires -d)")
+    p.add_argument("-D", help="FIDO2 device path")
+    p.add_argument("-y", action="store_true", help="assume yes")
+    p.set_defaults(func=cmd_upgrade_wrappers)
 
     p = sub.add_parser("recover-pending", help="finalize unresolved pending create/migrate operation")
     p.add_argument("-f", action="store_true", help="replace existing dataset entry from pending state")
