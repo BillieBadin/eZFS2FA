@@ -51,7 +51,6 @@ class FidoDeviceInfo:
             "options":           self.options,
             "serial":            self.serial,
             "serial_source":     self.serial_source,
-# ------------------------------------------------------------------------------
         }
     # --------------------------------------------------------------------------
 
@@ -134,7 +133,6 @@ def freebsd_uhid_candidates() -> List[str]:
             return int(suffix), path.name
         except ValueError:
             return 9999, path.name
-# ------------------------------------------------------------------------------
     return [str(path) for path in sorted(Path("/dev").glob("uhid*"), key=sort_key)]
     # --------------------------------------------------------------------------
 
@@ -145,7 +143,7 @@ def choose_from_devices(devices: List[FidoDeviceInfo], requested: Optional[str])
     responsive = [dev for dev in devices if dev.responsive]
     if requested:
         for dev in responsive:
-            if   dev.path == requested or dev.label == requested: return dev
+            if dev.path == requested or dev.label == requested: return dev
         raise RuntimeError(f"requested FIDO device not found or not responsive: {requested}")
     if len(responsive) == 0:
         raise RuntimeError("no responsive FIDO2 device found")
@@ -158,7 +156,7 @@ def choose_from_devices(devices: List[FidoDeviceInfo], requested: Optional[str])
         answer = input("Select FIDO2 key number: ").strip()
         try:
             idx = int(answer)
-            if   1 <= idx <= len(responsive): return responsive[idx - 1]
+            if 1 <= idx <= len(responsive): return responsive[idx - 1]
         except ValueError:
             pass
         print("Invalid selection")
