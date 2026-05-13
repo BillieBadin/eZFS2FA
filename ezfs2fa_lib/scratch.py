@@ -18,28 +18,26 @@ import os
 import platform
 import secrets
 import subprocess
-from   pathlib import Path
-from   typing import Optional
+from   pathlib    import Path
+from   typing     import Optional
 
-from   .common import Error, eprint, require_commands, run, safe_name
+from   .common    import Error, ZFS_RAW_KEY_BYTES, eprint, require_commands, run, safe_name
+from   .crypto    import SecretKeyBytes
 
-FREEBSD_MD_SIZE       = "1m"
-FREEBSD_MD_WIPE_BYTES = 1024 * 1024
+FREEBSD_SCRATCH_BYTES = 1024 * 1024
 IO_BLOCK_BYTES        = 4096
 RUN_DIR               = Path("/var/run/ezfs2fa")
 KEY_FILENAME          = "zfs.rawkey"
+
 
 # ------------------------------------------------------------------------------
 class ScratchSpace:
     """
     Platform-specific volatile scratch filesystem
-
     On FreeBSD, this creates a malloc-backed md(4) UFS filesystem via:
-        mdmfs -M -s 1m -p 0700 -w root:wheel -o noatime md <mountpoint>
-
+        mdmfs -M -s 1048576b -p 0700 -w root:wheel -o noatime md <mountpoint>
     On Linux, this creates a ramfs mount via:
         mount -t ramfs -o mode=0700 ramfs <mountpoint>
-
     The key is stored as a regular file so OpenZFS can use a file:// key
     location. The file is wiped before teardown. On FreeBSD, the backing md
     device is also zeroed where possible before detaching.
@@ -88,7 +86,7 @@ class ScratchSpace:
         run([
             "mdmfs",
             "-M",
-            "-s", FREEBSD_MD_SIZE,
+            "-s", f"{FREEBSD_SCRATCH_BYTES}b",
             "-p", "0700",
             "-w", "root:wheel",
             "-o", "noatime",
@@ -143,8 +141,12 @@ class ScratchSpace:
     # --------------------------------------------------------------------------
 
     # --------------------------------------------------------------------------
-    def write_key(self, key: bytes) -> None:
+    def write_key(self, key: SecretKeyBytes) -> None:
         """Write key bytes as a 0600 regular file on volatile scratch"""
+        if not isinstance(key, SecretKeyBytes):
+            raise Error("scratch key must be a mutable bytearray")
+        if len(key) != ZFS_RAW_KEY_BYTES:
+            raise Error(f"scratch key must be exactly {ZFS_RAW_KEY_BYTES} bytes")
         key_path = self.key_path()
         self.wipe_key_file()
         with key_path.open("wb", buffering=0) as handle:
@@ -196,10 +198,10 @@ class ScratchSpace:
         if   self.path is None or not self.path.exists(): return
         try:
             with self.path.open("r+b", buffering=0) as handle:
-                remaining = FREEBSD_MD_WIPE_BYTES
+                remaining = FREEBSD_SCRATCH_BYTES
                 chunk = b"\x00" * IO_BLOCK_BYTES
                 while remaining > 0:
-                    write_len = min(len(chunk), remaining)
+                    write_len  = min(len(chunk), remaining)
                     handle.write(chunk[:write_len])
                     remaining -= write_len
                 handle.flush()
@@ -214,7 +216,6 @@ class ScratchSpace:
         if self.path is None and self.mountpoint is not None and self.os_name == "FreeBSD":
             self.path = self._mounted_device()
         if   self.path is None and self.mountpoint is None: return
-# ------------------------------------------------------------------------------
         self._infer_mountpoint()
         if self.mountpoint is not None:
             self.wipe_key_file()
