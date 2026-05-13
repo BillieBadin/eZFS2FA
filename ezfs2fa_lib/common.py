@@ -15,11 +15,11 @@ from   datetime import datetime, timezone
 from   pathlib import Path
 from   typing import Iterable, Optional
 
-VERSION                   = "1.0.0"
+VERSION                   = "1.0.1"
 FREEBSD_INSTALLED_CONFIG  = Path("/usr/local/etc/ezfs2fa.json")
 LINUX_INSTALLED_CONFIG    = Path("/etc/ezfs2fa.json")
 ZFS_RAW_KEY_BYTES         = 32
-WRAP_VERSION              = "ezfs2fa-wrap-v3.0.0"
+WRAP_VERSION              = "ezfs2fa-wrap-v3.0.1"
 INSTALLED_SCRIPT_DIRS     = {
     Path("/usr/local/libexec/ezfs2fa"),
     Path("/usr/local/share/ezfs2fa"),
