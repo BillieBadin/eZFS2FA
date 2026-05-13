@@ -29,7 +29,7 @@ Linux      /etc/ezfs2fa.json
 
 Standalone mode is also supported. If `ezfs2fa.py` is run outside the installed libexec directory, it uses `ezfs2fa.json` next to the script by default.
 
-The JSON file contains dataset metadata, FIDO2 credential material, per-wrapper KDF metadata, IVs, wrapped-key ciphertexts, HMAC tags, convenience device metadata, per-wrapper backup timestamps (`last_export_at`), backup evidence timestamps for `pack` and `export-raw`, and pending operation journal state (`pending_op`). It does **not** contain the raw OpenZFS dataset key.
+The JSON file contains dataset metadata, FIDO2 credential IDs + salts, per-wrapper KDF metadata, IVs, wrapped-key ciphertexts, HMAC tags, convenience device metadata, per-wrapper backup timestamps (`last_export_at`), backup evidence timestamps for `pack` and `export-raw`, and pending operation journal state (`pending_op`). It does **not** contain the raw OpenZFS dataset key.
 
 Back up this JSON file. Without it, the FIDO2 key alone is not enough to reconstruct the same `hmac-secret` context.
 
@@ -40,6 +40,8 @@ Every command run checks backup evidence and warns when no evidence exists yet. 
 - `export-raw` has been run at least once.
 
 You can manually stamp wrapper backup timestamps with `--manualbackup`, but this only records operator intent. You are still responsible for keeping real protected backups.
+
+In-memory secret handling uses mutable buffers (`bytearray`) with explicit best-effort zeroing after use. Python/runtime internals may still retain transient immutable copies, so this is defense-in-depth, not a formal memory-sanitization guarantee.
 
 ## Security model
 
@@ -58,8 +60,9 @@ Every wrapper records two explicit flags:
 
 or another combination, depending on how it was created.
 
-Wrappers are strict `ezfs2fa-wrap-v3.0.0` records. Older wrapper formats are not accepted.
-Config loading is also strict: missing required keys are treated as invalid config and are not auto-migrated.
+Wrappers are strict `ezfs2fa-wrap-v3.0.1` records at runtime.
+Legacy `ezfs2fa-wrap-v3.0.0` wrappers must be explicitly upgraded with `upgrade-wrappers` before unlock/export/add operations.
+Config loading is also strict: missing required keys are treated as invalid config and are not auto-upgraded.
 
 ---
 
@@ -80,13 +83,10 @@ Click on the ***Show: ... diagram*** section title to display the PlantUML workf
    - random `kdf_salt_b64` (16 bytes)
    - `kdf_n=32768`, `kdf_r=8`, `kdf_p=3`, `kdf_dklen=64`
 4. Derive passphrase material using `hashlib.scrypt(...)` with the stored parameters.
-5. Derive final wrapping material with SHA-512 over:
-   - wrapper version context;
-   - factor flags;
-   - KDF name;
-   - optional FIDO secret;
-   - optional scrypt-derived passphrase material.
-6. Split SHA-512 output into:
+5. Derive final wrapping material with HKDF-SHA-512:
+   - HKDF-Extract over combined factor material;
+   - HKDF-Expand with wrapper context (`passphrase`, `fido2`, `kdf_name`).
+6. Split HKDF output into:
    - first 32 bytes: AES-256 key;
    - last 32 bytes: HMAC-SHA256 key.
 7. Encrypt raw key using in-process AES-256-CTR with random 16-byte IV.
@@ -104,15 +104,19 @@ Click on the ***Show: ... diagram*** section title to display the PlantUML workf
 
 ### Unlock / unwrap path
 
-1. Validate wrapper version is exactly `ezfs2fa-wrap-v3.0.0`.
+1. Validate wrapper version is exactly `ezfs2fa-wrap-v3.0.1`.
 2. Re-collect enabled factors (passphrase and/or FIDO2 `hmac-secret`).
 3. Recompute scrypt-derived passphrase material from stored per-wrapper KDF metadata.
-4. Re-derive AES/HMAC keys using the same context/factors/KDF name.
+4. Re-derive AES/HMAC keys using the same context/factors/KDF name and wrapper `wrap_kdf` metadata.
 5. Verify HMAC before decrypting.
 6. Decrypt wrapped key using AES-256-CTR.
 7. Validate decrypted raw key length is exactly 32 bytes.
 
 This gives explicit integrity-before-decrypt behavior and binds both factor policy and KDF metadata into authenticated context.
+
+Compatibility note:
+- runtime unwrap paths are current-version only (`ezfs2fa-wrap-v3.0.1`);
+- legacy `ezfs2fa-wrap-v3.0.0` wrappers are upgraded via `ezfs2fa upgrade-wrappers`.
 
 When FIDO2 is enabled, the tool stores best-effort metadata about the hardware key, including serial number when `ykman list --serials` is available and sees exactly one key. This metadata is informational only. The real binding is the FIDO2 credential and the `hmac-secret` result.
 
@@ -157,10 +161,10 @@ The scratch layer is transparent to the user.
 On FreeBSD, `ezfs2fa` uses:
 
 ```sh
-mdmfs -M -s 1m -p 0700 -w root:wheel -o noatime md /var/run/ezfs2fa/<label>
+mdmfs -M -s 1048576b -p 0700 -w root:wheel -o noatime md /var/run/ezfs2fa/<label>
 ```
 
-This creates a malloc-backed md(4) disk, creates UFS on it, and mounts it. The raw ZFS key is written as a regular 32-bytes file on that volatile filesystem so OpenZFS can consume it through `file://...`.
+This creates a malloc-backed md(4) disk, creates UFS on it, and mounts it. The scratch allocation is fixed at 1 MiB (1024 * 1024 bytes). The raw ZFS key is written as a regular 32-bytes file on that volatile filesystem so OpenZFS can consume it through `file://...`.
 
 ### Linux
 
@@ -313,10 +317,24 @@ Resolve pending operation state after interruption:
 ezfs2fa recover-pending
 ```
 
+`recover-pending` also normalizes dataset `keylocation=prompt` in case an interruption happened between `zfs create`/`zfs change-key` and the final `zfs set keylocation=prompt`.
+
 Drop stale pending state without finalizing dataset entry:
 
 ```sh
 ezfs2fa recover-pending --drop
+```
+
+Upgrade legacy wrapper records in place:
+
+```sh
+ezfs2fa upgrade-wrappers
+```
+
+Upgrade one wrapper on one dataset:
+
+```sh
+ezfs2fa upgrade-wrappers -d zroot/secure -n primary -D /dev/uhid0
 ```
 
 Force-clear pending operation state before any command:
@@ -371,7 +389,13 @@ ezfs2fa lock --snapshot before-service-stop
 Add another wrapper:
 
 ```sh
-ezfs2fa add -o primary -n backup1 --passphrase --fido -D /dev/uhid0
+ezfs2fa add \
+    -o primary \
+    -n backup1 \
+    --passphrase \
+    --fido \
+    --old-fido-device /dev/uhid0 \
+    --new-fido-device /dev/uhid0
 ```
 
 Back up the JSON file:
@@ -395,6 +419,8 @@ Create a tar.gz archive containing only the JSON file:
 ```sh
 ezfs2fa pack -o /mnt/offline/ezfs2fa-json.tar.gz
 ```
+
+`pack` creates an **unencrypted** archive. Encrypt the archive separately before offsite/shared storage.
 
 Dangerous raw key export:
 
@@ -420,6 +446,8 @@ Modules located in `ezfs2fa_lib/`:
 - `fido.py`        CLI FIDO manager
 - `fido_cli.py`    libfido2 command-line backend
 - `fido_common.py` FIDO metadata helpers
+- `key_wrap.py`    current wrapper create/unwrap cryptographic logic
+- `wrapper_upgrade.py` isolated wrapper-version upgrade logic
 - `scratch.py`     FreeBSD mdmfs / Linux ramfs scratch
 - `zfsops.py`      OpenZFS subprocess operations
 

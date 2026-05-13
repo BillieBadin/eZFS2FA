@@ -89,6 +89,9 @@ As with all Python code, runtime internals can still retain transient immutable 
 **ALWAYS** make backups of the JSON file with the wrappers.
 It contains vital information and useless without at least a full wrapper per encrypted dataset: passphrase and/or hardware key; without them or an raw ZFS key, the data is unrecoverable.
 
+If you upgrade from legacy wrapper records, upgrade them explicitly with:
+`ezfs2fa upgrade-wrappers`
+
 `ezfs2fa pack` creates an **unencrypted** tar.gz archive of that JSON file.
 While the material in that file has no raw keys, encrypting that archive or storing it in an encrypted media is recommended prior to placing it on shared/offsite storage.
 
