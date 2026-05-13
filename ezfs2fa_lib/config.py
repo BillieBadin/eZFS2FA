@@ -15,6 +15,16 @@ from   typing import Any, Dict, Optional
 
 from   .common import Error, VERSION, chmod_private, now_utc
 
+REQUIRED_WRAPPER_FIELDS = {
+    "wrap_version",
+    "iv_b64",
+    "wrapped_key_b64",
+    "tag_b64",
+    "passphrase",
+    "fido2",
+    "last_export_at",
+}
+
 # ------------------------------------------------------------------------------
 def default_config() -> Dict[str, Any]:
     """Return a fresh default configuration object"""
@@ -49,6 +59,37 @@ def ensure_config(path: Path) -> Dict[str, Any]:
 # ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
+def validate_wrapper(name: str, dataset: str, wrapper: Dict[str, Any]) -> None:
+    """Validate one wrapper object"""
+    missing = REQUIRED_WRAPPER_FIELDS - set(wrapper)
+    if missing:
+        joined = ", ".join(sorted(missing))
+        raise Error(f"invalid config: wrapper '{name}' in '{dataset}' missing fields: {joined}")
+    for key in ["wrap_version", "iv_b64", "wrapped_key_b64", "tag_b64"]:
+        value = wrapper.get(key)
+        if not isinstance(value, str) or not value:
+            raise Error(f"invalid config: wrapper '{name}' in '{dataset}' field '{key}' must be a non-empty string")
+    for key in ["passphrase", "fido2"]:
+        if not isinstance(wrapper.get(key), bool):
+            raise Error(f"invalid config: wrapper '{name}' in '{dataset}' field '{key}' must be boolean")
+    if not wrapper.get("passphrase") and not wrapper.get("fido2"):
+        raise Error(f"invalid config: wrapper '{name}' in '{dataset}' must enable passphrase and/or fido2")
+    if not isinstance(wrapper.get("last_export_at"), (str, type(None))):
+        raise Error(f"invalid config: wrapper '{name}' in '{dataset}' field 'last_export_at' must be a string or null")
+    if wrapper.get("passphrase"):
+        if wrapper.get("kdf_name") != "scrypt":
+            raise Error(f"invalid config: wrapper '{name}' in '{dataset}' passphrase wrappers must use kdf_name=scrypt")
+        for key in ["kdf_salt_b64", "kdf_n", "kdf_r", "kdf_p", "kdf_dklen"]:
+            if key not in wrapper:
+                raise Error(f"invalid config: wrapper '{name}' in '{dataset}' missing passphrase KDF field '{key}'")
+    if wrapper.get("fido2"):
+        for key in ["credential_id_b64", "hmac_salt_b64"]:
+            value = wrapper.get(key)
+            if not isinstance(value, str) or not value:
+                raise Error(f"invalid config: wrapper '{name}' in '{dataset}' missing or invalid FIDO field '{key}'")
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
 def validate_config(cfg: Dict[str, Any]) -> None:
     """Validate strict config schema (no compatibility migration)"""
     if not isinstance(cfg, dict):
@@ -78,8 +119,7 @@ def validate_config(cfg: Dict[str, Any]) -> None:
         for name, wrapper in wrappers.items():
             if not isinstance(wrapper, dict):
                 raise Error(f"invalid config: wrapper '{name}' in '{dataset}' must be an object")
-            if "last_export_at" not in wrapper:
-                raise Error(f"invalid config: wrapper '{name}' in '{dataset}' missing last_export_at")
+            validate_wrapper(name, dataset, wrapper)
 # ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
