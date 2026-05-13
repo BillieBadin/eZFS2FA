@@ -77,7 +77,9 @@ def safe_name(value: str) -> str:
     """Return a conservative name for labels and paths"""
     allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
     cleaned = "".join(ch for ch in value if ch in allowed)
-    return cleaned or "item"
+    if cleaned:
+        return cleaned
+    raise Error(f"invalid name: {value!r} contains no safe characters")
 # ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
