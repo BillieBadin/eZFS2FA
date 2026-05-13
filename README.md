@@ -79,13 +79,22 @@ ezfs2fa --help
 
 ---
 
+## 🔒 Notes on security 🔒
+
+Secret buffers are wiped in-memory on a best-effort basis with mutable byte arrays.
+As with all Python code, runtime internals can still retain transient immutable copies.
+
 ## ⚠️ Backups ⚠️
 
 **ALWAYS** make backups of the JSON file with the wrappers.
 It contains vital information and useless without at least a full wrapper per encrypted dataset: passphrase and/or hardware key; without them or an raw ZFS key, the data is unrecoverable.
 
-An export of the ZFS raw key is also strongly recommended. It provides a native recovery path, fully independant from the wrapping technology used in `eZFS2FA+`.
-That key material oviously needs to be handled with utmost care, and be stored in a very safe offline location.
+`ezfs2fa pack` creates an **unencrypted** tar.gz archive of that JSON file.
+While the material in that file has no raw keys, encrypting that archive or storing it in an encrypted media is recommended prior to placing it on shared/offsite storage.
+
+An export of the ZFS raw key is also strongly recommended.
+It provides a native recovery path, fully independant from the wrapping technology used in `eZFS2FA+`.
+That key material oviously needs to be handled with utmost care, and be stored in a very secure and safe offline location.
 
 ## Licence
 
