@@ -7,11 +7,126 @@ OpenZFS subprocess operations
 
 from   __future__ import annotations
 
-from   datetime import datetime, timezone
-from   pathlib import Path
-from   typing import Optional
+from   datetime   import datetime, timezone
+from   pathlib    import Path
+from   typing     import Dict, List, Optional
 
-from   .common import Error, require_commands, run
+from   .common    import Error, require_commands, run
+
+
+# ------------------------------------------------------------------------------
+def _decode_output(data: bytes) -> str:
+    """Decode subprocess output as UTF-8 with replacement"""
+    return data.decode("utf-8", "replace")
+# ------------------------------------------------------------------------------
+
+
+# ------------------------------------------------------------------------------
+def _split_fields(line: str, expected: int, *, command: str) -> List[str]:
+    """Split one -H output line into exactly expected tab-delimited fields"""
+    fields = line.rstrip("\n").split("\t")
+    if len(fields) != expected:
+        raise Error(f"unexpected output from {command}: {line}")
+    return fields
+# ------------------------------------------------------------------------------
+
+
+# ------------------------------------------------------------------------------
+def list_imported_zpools() -> List[Dict[str, str]]:
+    """Return imported zpools with capacity and health details"""
+    require_commands(["zpool"])
+    proc   = run(["zpool", "list", "-Hp", "-o", "name,size,alloc,free,health"], capture=True, check=False)
+    stdout = _decode_output(proc.stdout).strip()
+    stderr = _decode_output(proc.stderr).strip()
+    if proc.returncode != 0:
+        detail = "\n".join(part for part in [stderr, stdout] if part)
+        lower  = detail.lower()
+        if "no pools available" in lower: return []
+        raise Error(f"command failed: zpool list -Hp -o name,size,alloc,free,health\n{detail or f'exit status {proc.returncode}'}")
+    if not stdout: return []
+    pools: List[Dict[str, str]] = []
+    for line in stdout.splitlines():
+        if not line.strip(): continue
+        name, size, alloc, free, health = _split_fields(line, 5, command="zpool list")
+        pools.append({
+            "name":   name,
+            "size":   size,
+            "alloc":  alloc,
+            "free":   free,
+            "health": health,
+        })
+    return pools
+# ------------------------------------------------------------------------------
+
+
+# ------------------------------------------------------------------------------
+def list_importable_zpools() -> List[Dict[str, str]]:
+    """Return zpools visible to `zpool import`"""
+    require_commands(["zpool"])
+    proc   = run(["zpool", "import"], capture=True, check=False)
+    stdout = _decode_output(proc.stdout)
+    stderr = _decode_output(proc.stderr)
+    text   = "\n".join(part for part in [stdout, stderr] if part).strip()
+    pools: List[Dict[str, str]] = []
+    seen   = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("pool:"): continue
+        name = line.split(":", 1)[1].strip()
+        if not name or name in seen: continue
+        pools.append({"name": name})
+        seen.add(name)
+    if proc.returncode != 0 and not pools:
+        lower = text.lower()
+        if "no pools available to import" in lower: return []
+        raise Error(f"command failed: zpool import\n{text or f'exit status {proc.returncode}'}")
+    return pools
+# ------------------------------------------------------------------------------
+
+
+# ------------------------------------------------------------------------------
+def list_zpools() -> Dict[str, List[Dict[str, str]]]:
+    """Return imported and importable zpool inventories"""
+    return {
+        "imported":   list_imported_zpools(),
+        "importable": list_importable_zpools(),
+    }
+# ------------------------------------------------------------------------------
+
+
+# ------------------------------------------------------------------------------
+def list_datasets() -> List[Dict[str, str]]:
+    """Return all filesystem and volume datasets with key properties"""
+    require_commands(["zfs"])
+    proc = run([
+        "zfs", "list",
+        "-H",
+        "-o", "name,type,encryption,keystatus,mounted,mountpoint,volsize",
+        "-t", "filesystem,volume",
+    ], capture=True, check=False)
+    stdout = _decode_output(proc.stdout).strip()
+    stderr = _decode_output(proc.stderr).strip()
+    if proc.returncode != 0:
+        detail = "\n".join(part for part in [stderr, stdout] if part)
+        lower  = detail.lower()
+        if "no datasets available" in lower: return []
+        raise Error(f"command failed: zfs list -H -o name,type,encryption,keystatus,mounted,mountpoint,volsize -t filesystem,volume\n{detail or f'exit status {proc.returncode}'}")
+    if not stdout: return []
+    datasets: List[Dict[str, str]] = []
+    for line in stdout.splitlines():
+        if not line.strip(): continue
+        name, ds_type, encryption, keystatus, mounted, mountpoint, volsize = _split_fields(line, 7, command="zfs list")
+        datasets.append({
+            "name":       name,
+            "type":       ds_type,
+            "encryption": encryption,
+            "keystatus":  keystatus,
+            "mounted":    mounted,
+            "mountpoint": mountpoint,
+            "volsize":    volsize,
+        })
+    return datasets
+# ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
 def zfs_get(dataset: str, prop: str) -> str:
