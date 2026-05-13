@@ -6,7 +6,8 @@
 ezfs2fa: FreeBSD/Linux OpenZFS dataset unlock with passphrase and/or FIDO2
 """
 
-from   __future__ import annotations
+# Standard libraries
+from   __future__          import annotations
 
 import argparse
 import getpass
@@ -18,28 +19,23 @@ import shutil
 import sys
 import tarfile
 import uuid
-from   pathlib import Path
-from   typing import Any, Dict, Optional
+from   pathlib             import Path
+from   typing              import Any, Dict, List, Optional, Set
 
-from   ezfs2fa_lib.common import (
-    VERSION,
-    WRAP_VERSION,
-    ZFS_RAW_KEY_BYTES,
+# eZFS2FA+ libraries
+from   ezfs2fa_lib.common  import (
+    VERSION, WRAP_VERSION, ZFS_RAW_KEY_BYTES,
     Error,
     default_config_path,
-    eprint,
-    now_utc,
-    prompt_confirm,
-    prompt_value,
-    require_commands,
-    require_root,
-    safe_name,
+    eprint, now_utc, safe_name,
+    prompt_confirm, prompt_value,
+    require_commands, require_root,
 )
-from   ezfs2fa_lib.config import dataset_entry, ensure_config, resolve_dataset, save_config
-from   ezfs2fa_lib.crypto import aes_ctr, b64d, b64e, default_kdf_params, derive_wrap_keys, tag_payload, validate_raw_key
-from   ezfs2fa_lib.fido import FidoManager
+from   ezfs2fa_lib.config  import dataset_entry, ensure_config, resolve_dataset, save_config
+from   ezfs2fa_lib.crypto  import aes_ctr, b64d, b64e, default_kdf_params, derive_wrap_keys, tag_payload, validate_raw_key
+from   ezfs2fa_lib.fido    import FidoManager
 from   ezfs2fa_lib.scratch import ScratchSpace
-from   ezfs2fa_lib import zfsops
+from   ezfs2fa_lib         import zfsops
 
 
 DEFAULT_CONFIG = str(default_config_path(__file__))
@@ -351,6 +347,120 @@ def ensure_no_pending_for_mutation(
 
 
 # ------------------------------------------------------------------------------
+def cancel_pending_op(
+    cfg_path: Path,
+    cfg:      Dict[str, Any]
+) -> bool:
+    """Drop pending operation metadata if present; return True when changed"""
+    if not cfg.get("pending_op"):
+        return False
+    clear_pending_op(cfg)
+    try:
+        save_config(cfg_path, cfg)
+    except Exception as exc:
+        raise Error(f"failed to clear pending operation: {exc}") from exc
+    return True
+# ------------------------------------------------------------------------------
+
+
+# ------------------------------------------------------------------------------
+def validate_dataset_name(
+    dataset:         str,
+    *,
+    allow_pool_root: bool
+) -> None:
+    """Validate conservative dataset syntax before invoking ZFS commands"""
+    if not dataset:
+        raise Error("dataset name is empty")
+    if dataset != dataset.strip():
+        raise Error(f"dataset has leading/trailing whitespace: {dataset!r}")
+    if any(ch.isspace() for ch in dataset):
+        raise Error(f"dataset contains whitespace: {dataset!r}")
+    if any(ch in {"@", "#"} for ch in dataset):
+        raise Error(f"dataset must not include snapshot/bookmark separators: {dataset!r}")
+    if dataset.startswith("/") or dataset.endswith("/") or "//" in dataset:
+        raise Error(f"invalid dataset path format: {dataset!r}")
+    if not allow_pool_root and "/" not in dataset:
+        raise Error(f"dataset must include pool and child dataset, for example 'zroot/secure': {dataset!r}")
+# ------------------------------------------------------------------------------
+
+
+# ------------------------------------------------------------------------------
+def dataset_pool_name(dataset: str) -> str:
+    """Return the pool component from a dataset path"""
+    return dataset.split("/", 1)[0]
+# ------------------------------------------------------------------------------
+
+
+# ------------------------------------------------------------------------------
+def list_pool_names(zpools: Dict[str, List[Dict[str, str]]]) -> Set[str]:
+    """Collect every known pool name from imported/importable inventories"""
+    names: Set[str] = set()
+    for pool in zpools.get("imported", []):
+        name = pool.get("name")
+        if name:
+            names.add(name)
+    for pool in zpools.get("importable", []):
+        name = pool.get("name")
+        if name:
+            names.add(name)
+    return names
+# ------------------------------------------------------------------------------
+
+
+# ------------------------------------------------------------------------------
+def imported_pool_names(zpools: Dict[str, List[Dict[str, str]]]) -> Set[str]:
+    """Collect currently imported pool names"""
+    return {pool["name"] for pool in zpools.get("imported", []) if pool.get("name")}
+# ------------------------------------------------------------------------------
+
+
+# ------------------------------------------------------------------------------
+def importable_pool_names(zpools: Dict[str, List[Dict[str, str]]]) -> Set[str]:
+    """Collect pools visible to zpool import"""
+    return {pool["name"] for pool in zpools.get("importable", []) if pool.get("name")}
+# ------------------------------------------------------------------------------
+
+
+# ------------------------------------------------------------------------------
+def suggest_dataset_default(
+    zpools:     Dict[str, List[Dict[str, str]]],
+    live_items: List[Dict[str, str]],
+    fallback:   str = "zroot/secure"
+) -> str:
+    """Choose a non-conflicting dataset prompt default from current pools"""
+    existing  = {item["name"] for item in live_items if item.get("name")}
+    pools     = sorted(imported_pool_names(zpools))
+    if not pools:
+        pools = sorted(importable_pool_names(zpools))
+    if pools:
+        base  = f"{pools[0]}/secure"
+    else:
+        base  = fallback
+    if base not in existing: return base
+    suffix    = 2
+    while f"{base}{suffix}" in existing:
+        suffix += 1
+    return f"{base}{suffix}"
+# ------------------------------------------------------------------------------
+
+
+# ------------------------------------------------------------------------------
+def print_zpool_inventory(zpools: Dict[str, List[Dict[str, str]]]) -> None:
+    """Print imported and importable zpool inventories"""
+    imported = zpools.get("imported", [])
+    print(f"Imported zpools: {len(imported)}")
+    if imported:
+        for pool in imported:
+            print(f"    {pool.get('name', '?')} health={pool.get('health', '?')} size={pool.get('size', '?')} alloc={pool.get('alloc', '?')} free={pool.get('free', '?')}")
+    else:
+        print("    none")
+    importable_names = sorted(pool["name"] for pool in zpools.get("importable", []) if pool.get("name"))
+    print("Importable zpools: " + (", ".join(importable_names) if importable_names else "none"))
+# ------------------------------------------------------------------------------
+
+
+# ------------------------------------------------------------------------------
 def cmd_init(args: argparse.Namespace) -> None:
     """Create JSON config"""
     path = Path(args.c)
@@ -366,6 +476,11 @@ def cmd_init(args: argparse.Namespace) -> None:
 def cmd_list(args: argparse.Namespace) -> None:
     """List configured datasets and wrappers"""
     cfg      = ensure_config(Path(args.c))
+    try:
+        print_zpool_inventory(zfsops.list_zpools())
+    except Exception as exc:
+        print(f"Zpool inventory: unavailable: {exc}")
+    print("")
     datasets = cfg.get("datasets", {})
     if args.d:
         datasets = {args.d: dataset_entry(cfg, args.d)}
@@ -408,13 +523,13 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     os_name  = platform.system()
     if   os_name == "FreeBSD":
         scratch_backend = "mdmfs -M"
-        required        = ["zfs", "mdmfs", "mdconfig", "mount", "umount", "fido2-token", "fido2-cred", "fido2-assert"]
+        required        = ["zfs", "zpool", "mdmfs", "mdconfig", "mount", "umount", "fido2-token", "fido2-cred", "fido2-assert"]
     elif os_name == "Linux":
         scratch_backend = "ramfs"
-        required        = ["zfs", "mount", "umount", "fido2-token", "fido2-cred", "fido2-assert"]
+        required        = ["zfs", "zpool", "mount", "umount", "fido2-token", "fido2-cred", "fido2-assert"]
     else:
         scratch_backend = "unsupported"
-        required        = ["zfs", "fido2-token", "fido2-cred", "fido2-assert"]
+        required        = ["zfs", "zpool", "fido2-token", "fido2-cred", "fido2-assert"]
     print(f"ezfs2fa:        {VERSION}")
     print(f"OS:            {os_name}")
     print(f"Config:        {cfg_path}")
@@ -428,6 +543,10 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     for name in required:
         path = shutil.which(name)
         print(f"    {name:12} {path if path else 'missing'}")
+    try:
+        print_zpool_inventory(zfsops.list_zpools())
+    except Exception as exc:
+        print(f"Zpool check:    failed: {exc}")
     try:
         cfg = ensure_config(cfg_path)
         print(f"Datasets:      {len(cfg.get('datasets', {}))}")
@@ -487,28 +606,52 @@ def cmd_mkmd(args: argparse.Namespace) -> None:
 def cmd_create(args: argparse.Namespace) -> None:
     """Create encrypted dataset or migrate existing dataset and first wrapper"""
     require_root()
-    require_commands(["zfs"])
+    require_commands(["zfs", "zpool"])
     cfg_path   = Path(args.c)
     cfg        = ensure_config(cfg_path)
-    dataset    = args.migrate_dataset or args.d or prompt_value("Dataset", "zroot/secure")
+    zpools     = zfsops.list_zpools()
+    live_items = zfsops.list_datasets()
+    dataset    = args.migrate_dataset or args.d or prompt_value("Dataset", suggest_dataset_default(zpools, live_items))
     if args.migrate_dataset and args.d and args.migrate_dataset != args.d:
         raise Error(f"--migrate dataset does not match -d: {args.migrate_dataset} vs {args.d}")
-    rp_id      = args.r or cfg.get("defaults", {}).get("rp_id", "zfs.local")
-    name       = safe_name(args.n or prompt_value("First wrapper name", "primary"))
+    migrating  = bool(args.migrate_dataset)
+    validate_dataset_name(dataset, allow_pool_root=migrating)
+    pool_name  = dataset_pool_name(dataset)
+    pool_names = list_pool_names(zpools)
+    imported   = imported_pool_names(zpools)
+    importable = importable_pool_names(zpools)
+    if migrating:
+        if pool_name not in pool_names:
+            available = ", ".join(sorted(pool_names)) if pool_names else "none"
+            raise Error(f"zpool not found for dataset '{dataset}': '{pool_name}'. Imported/importable pools: {available}")
+    else:
+        if pool_name not in imported:
+            imported_text = ", ".join(sorted(imported)) if imported else "none"
+            importable_text = ", ".join(sorted(importable)) if importable else "none"
+            if pool_name in importable:
+                raise Error(f"zpool '{pool_name}' is visible but not imported; import it first. Imported pools: {imported_text}. Importable pools: {importable_text}")
+            raise Error(f"zpool not imported for dataset '{dataset}': '{pool_name}'. Imported pools: {imported_text}. Importable pools: {importable_text}")
+    live_by_name = {item["name"]: item for item in live_items if item.get("name")}
+    dataset_live = live_by_name.get(dataset)
+    rp_id        = args.r or cfg.get("defaults", {}).get("rp_id", "zfs.local")
+    name         = safe_name(args.n or prompt_value("First wrapper name", "primary"))
     use_passphrase, use_fido = resolve_auth_flags(args, prompt=True)
     if dataset in cfg.setdefault("datasets", {}) and not args.f:
         raise Error(f"dataset already exists in config: {dataset}. Use -f to overwrite config entry.")
-    migrating  = bool(args.migrate_dataset)
     if migrating:
-        key_status = zfsops.zfs_get(dataset, "keystatus")
+        if not dataset_live:
+            raise Error(f"dataset not found on host for migration: {dataset}")
+        key_status = dataset_live.get("keystatus", "")
         if key_status != "available":
             raise Error(f"dataset must be unlocked before migration: {dataset}")
-        if zfsops.zfs_get(dataset, "encryption") == "off":
+        if dataset_live.get("encryption", "") == "off":
             raise Error(f"dataset is not encrypted: {dataset}")
-        mountpoint = args.m or zfsops.zfs_get(dataset, "mountpoint")
+        mountpoint = args.m or dataset_live.get("mountpoint", "") or zfsops.zfs_get(dataset, "mountpoint")
         canmount   = args.C or zfsops.zfs_get(dataset, "canmount")
         eprint(f"About to migrate unlocked encrypted dataset {dataset} into ezfs2fa wrappers and rotate its wrapping key")
     else:
+        if dataset_live:
+            raise Error(f"dataset already exists on host: {dataset}. Use --migrate to enrol an existing encrypted dataset.")
         mountpoint = args.m or prompt_value("Mountpoint", "/secure")
         canmount   = args.C or cfg.get("defaults", {}).get("canmount", "noauto")
         eprint(f"About to create encrypted dataset {dataset} mounted at {mountpoint}")
@@ -719,13 +862,30 @@ def cmd_recover_pending(args: argparse.Namespace) -> None:
         save_config(cfg_path, cfg)
         print("Dropped pending operation without finalizing dataset entry.")
         return
-    require_commands(["zfs"])
+    require_commands(["zfs", "zpool"])
     op_id   = str(pending.get("id"))
     dataset = str(pending.get("dataset"))
     entry   = pending.get("entry")
     if not isinstance(entry, dict):
         raise Error("pending operation entry payload is invalid")
-    if zfsops.zfs_get(dataset, "encryption") == "off":
+    validate_dataset_name(dataset, allow_pool_root=True)
+    zpools     = zfsops.list_zpools()
+    pool_name  = dataset_pool_name(dataset)
+    pool_names = list_pool_names(zpools)
+    imported   = imported_pool_names(zpools)
+    importable = importable_pool_names(zpools)
+    if pool_name not in pool_names:
+        available       = ", ".join(sorted(pool_names)) if pool_names else "none"
+        raise Error(f"pending recovery refused: zpool not found for dataset '{dataset}': '{pool_name}'. Imported/importable pools: {available}")
+    if pool_name not in imported:
+        imported_text   = ", ".join(sorted(imported)) if imported else "none"
+        importable_text = ", ".join(sorted(importable)) if importable else "none"
+        raise Error(f"pending recovery refused: zpool '{pool_name}' is not imported. Imported pools: {imported_text}. Importable pools: {importable_text}")
+    live_by_name = {item["name"]: item for item in zfsops.list_datasets() if item.get("name")}
+    dataset_live = live_by_name.get(dataset)
+    if not dataset_live:
+        raise Error(f"pending recovery refused: dataset not found on host: {dataset}")
+    if dataset_live.get("encryption", "") == "off":
         raise Error(f"pending recovery refused: dataset is not encrypted: {dataset}")
     if dataset in cfg.get("datasets", {}) and not args.f:
         raise Error(f"dataset already exists in config: {dataset}. Use -f to replace it from pending state.")
@@ -739,7 +899,7 @@ def cmd_recover_pending(args: argparse.Namespace) -> None:
 # ------------------------------------------------------------------------------
 def apply_manual_backup(cfg_path: Path) -> None:
     """Manually stamp wrapper backup timestamps"""
-    cfg = ensure_config(cfg_path)
+    cfg   = ensure_config(cfg_path)
     stamp = now_utc()
     if not stamp_all_wrappers_export(cfg, stamp):
         eprint("WARNING: --manualbackup set, but no wrappers were found to timestamp.")
@@ -756,6 +916,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ezfs2fa", description="Easy FIDO/passphrase-backed OpenZFS dataset protection for FreeBSD.")
     parser.add_argument("-c", default=DEFAULT_CONFIG, help=f"JSON config path, default: {DEFAULT_CONFIG}")
     parser.add_argument("--manualbackup", action="store_true", help="manually mark all wrappers as backed up at the current time")
+    parser.add_argument("--cancel-pending", action="store_true", help="discard pending operation state before running command")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("init", help="create JSON config template")
@@ -864,6 +1025,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.manualbackup:
             apply_manual_backup(cfg_path)
         cfg = ensure_config(cfg_path)
+        if args.cancel_pending:
+            if cancel_pending_op(cfg_path, cfg):
+                eprint("WARNING: pending operation state cleared via --cancel-pending.")
+            else:
+                eprint("WARNING: --cancel-pending requested, but no pending operation was present.")
         warn_pending_op(cfg)
         ensure_no_pending_for_mutation(cfg, args.cmd)
         try:
