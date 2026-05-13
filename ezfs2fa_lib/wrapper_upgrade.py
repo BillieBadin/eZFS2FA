@@ -21,6 +21,8 @@ from   typing import Any, Dict, List, Optional
 from   .common import Error, WRAP_VERSION, prompt_confirm, require_root
 from   .config import dataset_entry, ensure_config, save_config
 from   .crypto import (
+    ByteMaterial,
+    SecretKeyBytes,
     WRAP_KDF_DEFAULT,
     aes_ctr,
     b64d,
@@ -42,7 +44,7 @@ def wrapper_needs_upgrade(wrapper: Dict[str, Any]) -> bool:
 # ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
-def _legacy_scrypt_material(passphrase: bytearray, wrapper: Dict[str, Any]) -> bytearray:
+def _legacy_scrypt_material(passphrase: SecretKeyBytes, wrapper: Dict[str, Any]) -> SecretKeyBytes:
     """Derive legacy per-wrapper passphrase material"""
     if wrapper.get("kdf_name") != "scrypt":
         raise Error(f"unsupported legacy passphrase KDF: {wrapper.get('kdf_name')}")
@@ -69,10 +71,10 @@ def _legacy_derive_wrap_keys(
     *,
     passphrase_enabled: bool,
     fido_enabled:       bool,
-    passphrase:         Optional[bytearray],
-    fido_secret:        Optional[bytearray],
+    passphrase:         Optional[SecretKeyBytes],
+    fido_secret:        Optional[SecretKeyBytes],
     wrapper:            Dict[str, Any],
-) -> tuple[bytearray, bytearray]:
+) -> tuple[SecretKeyBytes, SecretKeyBytes]:
     """Legacy v3.0.0 SHA-512 key combiner"""
     if not passphrase_enabled and not fido_enabled:
         raise Error("legacy wrapper has neither passphrase nor fido2 enabled")
@@ -80,7 +82,7 @@ def _legacy_derive_wrap_keys(
         raise Error("missing passphrase for legacy wrapper upgrade")
     if fido_enabled and fido_secret is None:
         raise Error("missing FIDO2 secret for legacy wrapper upgrade")
-    passphrase_material = bytearray()
+    passphrase_material: SecretKeyBytes = bytearray()
     if passphrase_enabled:
         passphrase_material = _legacy_scrypt_material(passphrase, wrapper)
         kdf_name            = str(wrapper.get("kdf_name", "unknown")).encode("ascii", "strict")
@@ -101,7 +103,7 @@ def _legacy_derive_wrap_keys(
 # ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
-def _hkdf_expand(prk: bytearray, info: bytes, out_len: int) -> bytearray:
+def _hkdf_expand(prk: SecretKeyBytes, info: bytes, out_len: int) -> SecretKeyBytes:
     """HKDF-Expand using HMAC-SHA512"""
     hash_len = hashlib.sha512().digest_size
     if out_len <= 0:
@@ -123,10 +125,10 @@ def _legacy_derive_hkdf_keys(
     *,
     passphrase_enabled: bool,
     fido_enabled:       bool,
-    passphrase:         Optional[bytearray],
-    fido_secret:        Optional[bytearray],
+    passphrase:         Optional[SecretKeyBytes],
+    fido_secret:        Optional[SecretKeyBytes],
     wrapper:            Dict[str, Any],
-) -> tuple[bytearray, bytearray]:
+) -> tuple[SecretKeyBytes, SecretKeyBytes]:
     """v3.0.0 HKDF key derivation (transitional wrappers)"""
     if not passphrase_enabled and not fido_enabled:
         raise Error("legacy wrapper has neither passphrase nor fido2 enabled")
@@ -134,13 +136,13 @@ def _legacy_derive_hkdf_keys(
         raise Error("missing passphrase for legacy wrapper upgrade")
     if fido_enabled and fido_secret is None:
         raise Error("missing FIDO2 secret for legacy wrapper upgrade")
-    passphrase_material = bytearray()
+    passphrase_material: SecretKeyBytes = bytearray()
     if passphrase_enabled:
         passphrase_material = _legacy_scrypt_material(passphrase, wrapper)
         kdf_name            = str(wrapper.get("kdf_name", "unknown")).encode("ascii", "strict")
     else:
         kdf_name            = b"none"
-    prk: Optional[bytearray] = None
+    prk: Optional[SecretKeyBytes] = None
     try:
         salt = hashlib.sha512(
             LEGACY_WRAP_VERSION.encode("ascii")
@@ -168,9 +170,9 @@ def _legacy_derive_hkdf_keys(
 # ------------------------------------------------------------------------------
 def _legacy_tag_payload(
     *,
-    mac_key:            bytearray,
-    iv:                 bytes,
-    ciphertext:         bytes,
+    mac_key:            SecretKeyBytes,
+    iv:                 ByteMaterial,
+    ciphertext:         ByteMaterial,
     passphrase_enabled: bool,
     fido_enabled:       bool,
     kdf_name:           str,
@@ -192,14 +194,14 @@ def _legacy_tag_payload(
 def _unwrap_legacy_wrapper(
     wrapper:     Dict[str, Any],
     *,
-    passphrase:  Optional[bytearray],
-    fido_secret: Optional[bytearray],
-) -> bytearray:
+    passphrase:  Optional[SecretKeyBytes],
+    fido_secret: Optional[SecretKeyBytes],
+) -> SecretKeyBytes:
     """Unwrap legacy v3.0.0 wrapper to recover raw key"""
     passphrase_enabled           = bool(wrapper.get("passphrase", False))
     fido_enabled                 = bool(wrapper.get("fido2", False))
-    aes_key: Optional[bytearray] = None
-    mac_key: Optional[bytearray] = None
+    aes_key: Optional[SecretKeyBytes] = None
+    mac_key: Optional[SecretKeyBytes] = None
     try:
         wrap_kdf = str(wrapper.get("wrap_kdf", LEGACY_WRAP_KDF))
         if wrap_kdf == LEGACY_WRAP_KDF:
@@ -245,17 +247,17 @@ def _unwrap_legacy_wrapper(
 def upgrade_v3_0_0_to_v3_0_1(
     wrapper:     Dict[str, Any],
     *,
-    passphrase:  Optional[bytearray],
-    fido_secret: Optional[bytearray],
+    passphrase:  Optional[SecretKeyBytes],
+    fido_secret: Optional[SecretKeyBytes],
 ) -> Dict[str, Any]:
     """Upgrade one wrapper record from v3.0.0 to v3.0.1"""
     if wrapper.get("wrap_version") != LEGACY_WRAP_VERSION:
         raise Error(f"upgrade_v3_0_0_to_v3_0_1 called for non-legacy wrapper version: {wrapper.get('wrap_version')}")
     passphrase_enabled           = bool(wrapper.get("passphrase", False))
     fido_enabled                 = bool(wrapper.get("fido2", False))
-    aes_key: Optional[bytearray] = None
-    mac_key: Optional[bytearray] = None
-    raw_key: Optional[bytearray] = None
+    aes_key: Optional[SecretKeyBytes] = None
+    mac_key: Optional[SecretKeyBytes] = None
+    raw_key: Optional[SecretKeyBytes] = None
     try:
         raw_key = _unwrap_legacy_wrapper(
             wrapper,
@@ -301,7 +303,7 @@ def upgrade_v3_0_0_to_v3_0_1(
 # ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
-def _prompt_upgrade_passphrase(confirm: bool = False) -> bytearray:
+def _prompt_upgrade_passphrase(confirm: bool = False) -> SecretKeyBytes:
     """Prompt for a non-empty wrapping passphrase"""
     first = getpass.getpass("Wrapping passphrase: ")
     if not first:
@@ -353,8 +355,8 @@ def cmd_upgrade_wrappers(args: argparse.Namespace) -> None:
             raise Error("cancelled")
     upgraded = 0
     for dataset, name, wrapper, entry in targets:
-        passphrase: Optional[bytearray]  = None
-        fido_secret: Optional[bytearray] = None
+        passphrase:  Optional[SecretKeyBytes] = None
+        fido_secret: Optional[SecretKeyBytes] = None
         try:
             if wrapper.get("passphrase"):
                 passphrase = _prompt_upgrade_passphrase(confirm=False)
