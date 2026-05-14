@@ -5,21 +5,22 @@
 Wrapping cryptography
 """
 
-from   __future__ import annotations
+from   __future__    import annotations
+from   typing        import Any, Dict, Optional, Tuple
 
 import base64
 import hashlib
 import hmac
 import secrets
-from   typing     import Any, Dict, Optional, Tuple
+# from   secretsharing import SecretSharer
 
-from   .common    import Error, WRAP_VERSION, ZFS_RAW_KEY_BYTES
+from   .common       import Error, WRAP_VERSION, ZFS_RAW_KEY_BYTES
 
-SCRYPT_N          = 1 << 15
-SCRYPT_R          = 8
-SCRYPT_P          = 3
-SCRYPT_DKLEN      = 64
-SCRYPT_SALT_BYTES = 16
+SCRYPT_N          = 1 << 15             # CPU/memory cost parameter
+SCRYPT_R          = 8                   # block size parameter; scales memory usage alongside N
+SCRYPT_P          = 3                   # parallelisation factor
+SCRYPT_DKLEN      = 64                  # derived key length in bytes
+SCRYPT_SALT_BYTES = 16                  # salt length
 WRAP_KDF_DEFAULT  = "hkdf-sha512-v1"
 SecretKeyBytes    = bytearray           # ZFS raw key, passphrase, etc. (mutuatable for in-place wiping)
 ByteMaterial      = bytes | bytearray   # Non-secret binary payloads (iv/ciphertext/base64 material)
