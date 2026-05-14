@@ -5,18 +5,18 @@
 CLI FIDO backend using libfido2 command-line tools
 """
 
-from   __future__ import annotations
+from   __future__   import annotations
+from   typing       import Any, Dict, List, Optional
 
 import base64
 import os
 import re
 import secrets
 import subprocess
-from   typing import Any, Dict, List, Optional
 
-from   .common import Error, eprint, require_commands
+from   .common      import Error, eprint, require_commands
 from   .fido_common import FidoDeviceInfo, choose_from_devices, freebsd_uhid_candidates, ykman_serial_if_single
-from   .scratch import ScratchSpace
+from   .scratch     import ScratchSpace
 
 # ------------------------------------------------------------------------------
 def _wipe_file(path: str) -> None:
@@ -134,7 +134,7 @@ def _parse_credential_id_b64(output: bytes) -> str:
     except Error:
         # libfido2 textual output can be positional on some versions. Keep this
         # fallback explicit and validated to avoid silent corruption.
-        lines = [line.strip() for line in output.decode("utf-8", "replace").splitlines() if line.strip()]
+        lines      = [line.strip() for line in output.decode("utf-8", "replace").splitlines() if line.strip()]
         positional = []
         for line in lines:
             tokens = _extract_b64_tokens(line)
@@ -142,7 +142,7 @@ def _parse_credential_id_b64(output: bytes) -> str:
                 positional.append(tokens[0])
         if len(positional) < 5:
             raise Error("unexpected fido2-cred output: cannot extract credential id")
-        token = positional[4]
+        token   = positional[4]
         decoded = base64.b64decode(token.encode("ascii"), validate=True)
         if len(decoded) < 16:
             raise Error("unexpected fido2-cred output: credential id is too short")
@@ -164,7 +164,7 @@ def _parse_hmac_secret(output: bytes) -> bytes:
             exact_len      = 32,
         )
     except Error:
-        lines = [line.strip() for line in output.decode("utf-8", "replace").splitlines() if line.strip()]
+        lines      = [line.strip() for line in output.decode("utf-8", "replace").splitlines() if line.strip()]
         positional = []
         for line in lines:
             tokens = _extract_b64_tokens(line)
@@ -172,7 +172,7 @@ def _parse_hmac_secret(output: bytes) -> bytes:
                 positional.append(tokens[0])
         if not positional:
             raise Error("unexpected fido2-assert output: hmac-secret field not found")
-        token = positional[-1]
+        token  = positional[-1]
     try:
         secret = base64.b64decode(token.encode("ascii"), validate=True)
     except Exception as exc:
@@ -338,7 +338,7 @@ class CliFidoBackend:
             in_path  = str(scratch.mountpoint / "assert.in")
             out_path = str(scratch.mountpoint / "assert.out")
             _write_private(in_path, assert_input)
-            output = b""
+            output   = b""
             try:
                 proc = subprocess.run(["fido2-assert", "-G", "-h", "-v", "-i", in_path, "-o", out_path, dev.path])
                 if proc.returncode != 0:
