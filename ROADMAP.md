@@ -1,5 +1,15 @@
 # ROADMAP
 
+## ZFS operations with `keyformat=hex`
+
+Consider replacing `keyformat=raw keylocation=file://...` by `keyformat=hex keylocation=prompt`.
+
+- It is simpler and easier to audit.
+- ZFS operations become ordinary subprocess calls with input_bytes.
+- It reduces cleanup risk. No key file, no unmount failure, no stale /var/run/ez2fdp/..., no md device detach failure.
+- It improves portability.
+- It makes emergency recovery easier because a hex key is text and can be typed by hand.
+
 ## Crypto
 
 ### Password derivation improvements
