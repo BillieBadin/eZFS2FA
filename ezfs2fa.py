@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 Billie Badin, SIGORYX Engineering
 """
-ezfs2fa: FreeBSD/Linux OpenZFS dataset unlock with passphrase and/or FIDO2
+ezfs2fa: OpenZFS dataset unlock with passphrase and/or FIDO2
 """
 
 # Standard libraries
@@ -12,7 +12,6 @@ from   __future__          import annotations
 import argparse
 import hashlib
 import os
-import platform
 import secrets
 import shutil
 import sys
@@ -24,7 +23,8 @@ from   typing              import Any, Dict, List, Optional, Set
 # eZFS2FA+ libraries
 from   ezfs2fa_lib.common  import (
     VERSION, ZFS_RAW_KEY_BYTES,
-    Error,
+    Error, RelaunchRequested,
+    chmod_private, current_os,
     default_config_path,
     eprint, now_utc, safe_name,
     prompt_confirm, prompt_value,
@@ -56,6 +56,24 @@ def resolve_auth_flags(
     if not use_passphrase and not use_fido:
         raise Error("at least one factor is required: --passphrase/--pass or --fido")
     return use_passphrase, use_fido
+# ------------------------------------------------------------------------------
+
+
+# ------------------------------------------------------------------------------
+def ensure_fido_backend_available(
+    cfg:      Dict[str, Any],
+    *,
+    use_fido: bool
+) -> None:
+    """Fail early with an actionable message when FIDO is requested but unavailable"""
+    if not use_fido: return
+    manager = FidoManager(cfg)
+    if manager.backend.available(): return
+    raise Error(
+        "FIDO2 wrapper requested, but no usable backend is available. "
+        f"{manager.unavailable_message()} "
+        "Alternatively, use --passphrase without --fido."
+    )
 # ------------------------------------------------------------------------------
 
 
@@ -355,6 +373,7 @@ def cmd_list(args: argparse.Namespace) -> None:
         print(f"    mountpoint: {entry.get('mountpoint', '')}")
         print(f"    rp_id:      {entry.get('rp_id', '')}")
         print(f"    canmount:   {entry.get('canmount', '')}")
+        print(f"    keyformat:  {entry.get('keyformat', 'raw')}")
         print(f"    created:    {entry.get('created_at', '')}")
         wrappers = entry.get("wrappers", {})
         if not wrappers:
@@ -383,29 +402,54 @@ def cmd_list(args: argparse.Namespace) -> None:
 def cmd_doctor(args: argparse.Namespace) -> None:
     """Print installation and runtime diagnostics"""
     cfg_path = Path(args.c)
-    os_name  = platform.system()
+    os_name  = current_os()
+    manager  = FidoManager({})
+    cli_tools = ["fido2-token", "fido2-cred", "fido2-assert"]
     if   os_name == "FreeBSD":
         scratch_backend = "mdmfs -M"
-        required        = ["zfs", "zpool", "mdmfs", "mdconfig", "mount", "umount", "fido2-token", "fido2-cred", "fido2-assert"]
+        base_required   = ["zfs", "zpool", "mdmfs", "mdconfig", "mount", "umount"]
     elif os_name == "Linux":
         scratch_backend = "ramfs"
-        required        = ["zfs", "zpool", "mount", "umount", "fido2-token", "fido2-cred", "fido2-assert"]
+        base_required   = ["zfs", "zpool", "mount", "umount"]
+    elif os_name == "Windows":
+        scratch_backend = "temporary private directory (compatibility mode)"
+        base_required   = ["zfs", "zpool"]
     else:
-        scratch_backend = "unsupported"
-        required        = ["zfs", "zpool", "fido2-token", "fido2-cred", "fido2-assert"]
+        scratch_backend = "temporary private directory (compatibility mode)"
+        base_required   = ["zfs", "zpool"]
+    required = list(base_required)
+    optional: List[str] = []
+    if os_name in {"FreeBSD", "Linux"}:
+        if getattr(manager.backend, "name", "") == "cli":
+            required.extend(cli_tools)
+        else:
+            optional = list(cli_tools)
     print(f"ezfs2fa:        {VERSION}")
     print(f"OS:            {os_name}")
     print(f"Config:        {cfg_path}")
     print(f"Scratch:       {scratch_backend}")
+    print(f"FIDO backend:  {getattr(manager.backend, 'name', 'unknown')}")
     try:
         import cryptography  # noqa: F401
         print("Crypto:        python-cryptography available")
     except ImportError:
         print("Crypto:        python-cryptography MISSING")
+    try:
+        import fido2  # noqa: F401
+        print("FIDO python:   fido2 available")
+    except ImportError:
+        print("FIDO python:   fido2 MISSING")
+    if not manager.backend.available():
+        print(f"FIDO status:   unavailable ({manager.unavailable_message()})")
     print("Commands:")
     for name in required:
         path = shutil.which(name)
         print(f"    {name:12} {path if path else 'missing'}")
+    if optional:
+        print("Optional commands (CLI fallback):")
+        for name in optional:
+            path = shutil.which(name)
+            print(f"    {name:12} {path if path else 'missing'}")
     try:
         print_zpool_inventory(zfsops.list_zpools())
     except Exception as exc:
@@ -431,14 +475,23 @@ def cmd_fido_list(args: argparse.Namespace) -> None:
     """List visible FIDO keys using configured backend preference"""
     cfg = ensure_config(Path(args.c))
     manager = FidoManager(cfg)
-    if args.D:
+    backend_name = getattr(manager.backend, "name", "")
+    if args.D and backend_name == "cli":
         # Show the explicit path through the CLI backend selection rules. This
         # is useful on FreeBSD where /dev/uhid0 may be a symlink to /dev/u2f/0
         # and may not be returned by automatic discovery while still working
         # perfectly with fido2-cred/fido2-assert.
         from   ezfs2fa_lib.fido_cli import CliFidoBackend
         devices = [CliFidoBackend()._choose(args.D)]
+    elif args.D and backend_name == "python-fido2" and current_os() != "Windows":
+        devices = manager.list_devices()
+        matches = [dev for dev in devices if dev.path == args.D or dev.label == args.D]
+        if not matches:
+            raise Error(f"FIDO device not found for -D: {args.D}")
+        devices = matches
     else:
+        if args.D:
+            eprint("WARNING: -D is ignored on Windows WebAuthn backend.")
         devices = manager.list_devices()
     for dev in devices:
         print(dev.path)
@@ -460,7 +513,7 @@ def cmd_mkmd(args: argparse.Namespace) -> None:
         raw_key = bytearray(secrets.token_bytes(ZFS_RAW_KEY_BYTES))
         try:
             scratch.write_key(raw_key)
-            print(str(scratch.path))
+            print(str(scratch.mountpoint or scratch.path or ""))
             eprint(f"key file: {scratch.key_path()}")
             eprint("Press Enter to destroy scratch filesystem.")
             input()
@@ -503,6 +556,7 @@ def cmd_create(args: argparse.Namespace) -> None:
     rp_id        = args.r or cfg.get("defaults", {}).get("rp_id", "zfs.local")
     name         = safe_name(args.n or prompt_value("First wrapper name", "primary"))
     use_passphrase, use_fido = resolve_auth_flags(args, prompt=True)
+    ensure_fido_backend_available(cfg, use_fido=use_fido)
     if dataset in cfg.setdefault("datasets", {}) and not args.f:
         raise Error(f"dataset already exists in config: {dataset}. Use -f to overwrite config entry.")
     if migrating:
@@ -519,44 +573,61 @@ def cmd_create(args: argparse.Namespace) -> None:
     else:
         if dataset_live:
             raise Error(f"dataset already exists on host: {dataset}. Use --migrate to enrol an existing encrypted dataset.")
-        mountpoint = args.m or prompt_value("Mountpoint", "/secure")
+        mountpoint_default = "/secure"
+        if current_os() == "Windows":
+            mountpoint_default = f"/{dataset}"
+        mountpoint = args.m or prompt_value("Mountpoint", mountpoint_default)
         canmount   = args.C or cfg.get("defaults", {}).get("canmount", "noauto")
         eprint(f"About to create encrypted dataset {dataset} mounted at {mountpoint}")
     if not args.y and not prompt_confirm("Continue"):
         raise Error("cancelled")
-    with ScratchSpace(safe_name(dataset)) as scratch:
-        raw_key = bytearray(secrets.token_bytes(ZFS_RAW_KEY_BYTES))
-        try:
-            entry = {
-                "dataset":    dataset,
-                "mountpoint": mountpoint,
-                "rp_id":      rp_id,
-                "canmount":   canmount,
-                "created_at": now_utc(),
-                "wrappers":   {},
-            }
-            entry["wrappers"][name] = wrap_key_record(raw_key, name=name, rp_id=rp_id, cfg=cfg, use_passphrase=use_passphrase, use_fido=use_fido, fido_device=args.D)
-            auto_add = bool(args.a)
-            while auto_add or prompt_confirm("Enrol another wrapper now"):
-                auto_add = False
-                new_name = safe_name(prompt_value("New wrapper name"))
-                new_passphrase, new_fido = resolve_auth_flags(args, prompt=True)
-                if new_name in entry["wrappers"]:
-                    raise Error(f"duplicate wrapper name: {new_name}")
-                entry["wrappers"][new_name] = wrap_key_record(raw_key, name=new_name, rp_id=rp_id, cfg=cfg, use_passphrase=new_passphrase, use_fido=new_fido, fido_device=args.D)
-            pending_id = start_pending_op(cfg_path, cfg, operation="migrate" if migrating else "create", dataset=dataset, entry=entry)
-            scratch.write_key(raw_key)
+    use_hex = bool(args.hex_key)
+    if use_hex:
+        eprint("Using keyformat=hex with keylocation=prompt. The dataset key is generated randomly and injected automatically.")
+    elif current_os() == "Windows":
+        eprint("WARNING: raw key mode on Windows uses compatibility scratch files. Prefer --hex when possible.")
+    raw_key = bytearray(secrets.token_bytes(ZFS_RAW_KEY_BYTES))
+    try:
+        entry = {
+            "dataset":    dataset,
+            "mountpoint": mountpoint,
+            "rp_id":      rp_id,
+            "canmount":   canmount,
+            "keyformat":  "hex" if use_hex else "raw",
+            "created_at": now_utc(),
+            "wrappers":   {},
+        }
+        entry["wrappers"][name] = wrap_key_record(raw_key, name=name, rp_id=rp_id, cfg=cfg, use_passphrase=use_passphrase, use_fido=use_fido, fido_device=args.D)
+        auto_add = bool(args.a)
+        while auto_add or prompt_confirm("Enrol another wrapper now"):
+            auto_add = False
+            new_name = safe_name(prompt_value("New wrapper name"))
+            new_passphrase, new_fido = resolve_auth_flags(args, prompt=True)
+            ensure_fido_backend_available(cfg, use_fido=new_fido)
+            if new_name in entry["wrappers"]:
+                raise Error(f"duplicate wrapper name: {new_name}")
+            entry["wrappers"][new_name] = wrap_key_record(raw_key, name=new_name, rp_id=rp_id, cfg=cfg, use_passphrase=new_passphrase, use_fido=new_fido, fido_device=args.D)
+        pending_id = start_pending_op(cfg_path, cfg, operation="migrate" if migrating else "create", dataset=dataset, entry=entry)
+        if use_hex:
+            key_hex = raw_key.hex()
             if migrating:
-                zfsops.change_key(dataset, scratch.key_path())
+                zfsops.change_key_hex(dataset, key_hex)
             else:
-                zfsops.create_dataset(dataset, mountpoint, canmount, scratch.key_path())
-            cfg["datasets"][dataset] = entry
-            clear_pending_op(cfg, expected_id=pending_id)
-            save_config(cfg_path, cfg)
-            if not migrating:
-                zfsops.mount_dataset(dataset)
-        finally:
-            wipe_buffer(raw_key) # always wipe key from memory no matter what
+                zfsops.create_dataset_hex(dataset, mountpoint, canmount, key_hex)
+        else:
+            with ScratchSpace(safe_name(dataset)) as scratch:
+                scratch.write_key(raw_key)
+                if migrating:
+                    zfsops.change_key(dataset, scratch.key_path())
+                else:
+                    zfsops.create_dataset(dataset, mountpoint, canmount, scratch.key_path())
+        cfg["datasets"][dataset] = entry
+        clear_pending_op(cfg, expected_id=pending_id)
+        save_config(cfg_path, cfg)
+        if not migrating:
+            zfsops.mount_dataset(dataset)
+    finally:
+        wipe_buffer(raw_key) # always wipe key from memory no matter what
     if migrating:
         print(f"Migrated dataset and updated config: {cfg_path}")
     else:
@@ -581,13 +652,19 @@ def cmd_unlock(args: argparse.Namespace) -> None:
     if   key_status == "available":
         eprint(f"ZFS key already loaded for {dataset}")
     elif key_status == "unavailable":
+        key_format    = zfsops.zfs_get(dataset, "keyformat").strip().lower()
         name, wrapper = choose_wrapper(entry, args.n)
-        raw_key = unwrap_key_record(wrapper, rp_id=rp_id, cfg=cfg, fido_device=args.D)
+        raw_key       = unwrap_key_record(wrapper, rp_id=rp_id, cfg=cfg, fido_device=args.D)
         try:
-            with ScratchSpace(safe_name(dataset)) as scratch:
-                scratch.write_key(raw_key)
-                zfsops.load_key(dataset, scratch.key_path(), dry_run=True)
-                zfsops.load_key(dataset, scratch.key_path(), dry_run=False)
+            if key_format == "hex":
+                key_hex = raw_key.hex()
+                zfsops.load_key_hex(dataset, key_hex, dry_run=True)
+                zfsops.load_key_hex(dataset, key_hex, dry_run=False)
+            else:
+                with ScratchSpace(safe_name(dataset)) as scratch:
+                    scratch.write_key(raw_key)
+                    zfsops.load_key(dataset, scratch.key_path(), dry_run=True)
+                    zfsops.load_key(dataset, scratch.key_path(), dry_run=False)
         finally:
             wipe_buffer(raw_key)
         eprint(f"Unlocked {dataset} using wrapper '{name}'")
@@ -613,6 +690,7 @@ def cmd_add(args: argparse.Namespace) -> None:
     if new_name in entry.setdefault("wrappers", {}) and not args.f:
         raise Error(f"wrapper already exists: {new_name}. Use -f to replace it.")
     use_passphrase, use_fido = resolve_auth_flags(args, prompt=True)
+    ensure_fido_backend_available(cfg, use_fido=use_fido)
     rp_id    = args.r or entry.get("rp_id", "zfs.local")
     raw_key  = unwrap_key_record(old_wrapper, rp_id=rp_id, cfg=cfg, fido_device=args.old_fido_device)
     try:
@@ -667,12 +745,12 @@ def cmd_backup(args: argparse.Namespace) -> None:
         raise Error(f"output exists: {out}. Use -f to overwrite.")
     out.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(cfg_path, out)
-    os.chmod(out, 0o600)
+    chmod_private(out)
     if not args.N:
         digest  = hashlib.sha256(out.read_bytes()).hexdigest()
         sidecar = out.with_name(out.name + ".sha256")
         sidecar.write_text(f"{digest}  {out.name}\n", encoding="utf-8")
-        os.chmod(sidecar, 0o600)
+        chmod_private(sidecar)
     cfg = ensure_config(cfg_path)
     if stamp_all_wrappers_export(cfg, now_utc()):
         save_config(cfg_path, cfg)
@@ -691,7 +769,7 @@ def cmd_pack(args: argparse.Namespace) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(out, "w:gz") as tar:
         tar.add(cfg_path, arcname=cfg_path.name)
-    os.chmod(out, 0o600)
+    chmod_private(out)
     cfg.setdefault("backup_evidence", {})["last_pack_at"] = now_utc()
     save_config(cfg_path, cfg)
     print(f"Packed JSON config (UNENCRYPTED archive) to: {out}")
@@ -721,7 +799,7 @@ def cmd_export_raw(args: argparse.Namespace) -> None:
             os.fsync(handle.fileno())
     finally:
         wipe_buffer(raw_key)
-    os.chmod(out, 0o600)
+    chmod_private(out)
     cfg.setdefault("backup_evidence", {})["last_export_raw_at"] = now_utc()
     save_config(cfg_path, cfg)
     print(f"Exported raw key for {dataset} using wrapper '{name}' to: {out}")
@@ -797,7 +875,7 @@ def apply_manual_backup(cfg_path: Path) -> None:
 # ------------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     """Build CLI parser"""
-    parser = argparse.ArgumentParser(prog="ezfs2fa", description="Easy FIDO/passphrase-backed OpenZFS dataset protection for FreeBSD.")
+    parser = argparse.ArgumentParser(prog="ezfs2fa", description="Easy FIDO/passphrase-backed OpenZFS dataset protection.")
     parser.add_argument("-c", default=DEFAULT_CONFIG, help=f"JSON config path, default: {DEFAULT_CONFIG}")
     parser.add_argument("--manualbackup", action="store_true", help="manually mark all wrappers as backed up at the current time")
     parser.add_argument("--cancel-pending", action="store_true", help="discard pending operation state before running command")
@@ -817,7 +895,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-D", help="show/probe this explicit FIDO2 device path")
     p.set_defaults(func=cmd_fido_list)
 
-    p = sub.add_parser("mkmd", help="create diagnostic mdmfs -M scratch filesystem")
+    p = sub.add_parser("mkmd", help="create diagnostic scratch filesystem")
     p.add_argument("-n", help="label")
     p.set_defaults(func=cmd_mkmd)
 
@@ -829,6 +907,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-D", help="FIDO2 device path")
     p.add_argument("-C", help="ZFS canmount value")
     p.add_argument("--migrate", dest="migrate_dataset", help="migrate existing unlocked encrypted DATASET into ezfs2fa wrappers and rotate key")
+    p.add_argument("--hex", action="store_true", dest="hex_key", help="use keyformat=hex; generate random key material and inject it as hex via prompt keylocation")
     p.add_argument("--passphrase", "--pass", action="store_true", dest="passphrase", help="protect wrapper with passphrase")
     p.add_argument("--fido", action="store_true", help="protect wrapper with FIDO2 hmac-secret")
     p.add_argument("-a", action="store_true", help="prompt to add another wrapper after first")
@@ -942,6 +1021,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     except KeyboardInterrupt:
         print("Interrupted", file=sys.stderr)
         return 130
+    except RelaunchRequested:
+        eprint("Elevation requested. Continue in the Administrator window.")
+        return 0
     except Error as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

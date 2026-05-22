@@ -17,12 +17,9 @@ from   .common    import Error, VERSION, WRAP_VERSION, chmod_private, now_utc
 from   .crypto    import WRAP_KDF_DEFAULT
 
 REQUIRED_WRAPPER_FIELDS = {
-    "wrap_version",
-    "iv_b64",
-    "wrapped_key_b64",
-    "tag_b64",
-    "passphrase",
-    "fido2",
+    "wrap_version", "wrapped_key_b64",
+    "iv_b64", "tag_b64",
+    "passphrase", "fido2",
     "last_export_at",
 }
 

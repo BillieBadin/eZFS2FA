@@ -43,21 +43,39 @@ Just export the ZFS raw encryption key to decrypt it in that new location, even 
 
 ## 📦 Limited dependencies 📦
 
-The dependencies are minimal: python3 plus cryptography library, and libfido2 (FreeBSD) or fido2-tools (Linux).
+The dependencies are minimal: python3 plus cryptography library, plus:
+- Preferred on all OS: python-fido2.
+- FreeBSD/Linux fallback: libfido2 CLI tools.
+- Windows path: python-fido2 with native WebAuthn.
 
 ### 👹 FreeBSD 👹
 
 - python311
 - py311-cryptography
+- python-fido2 https://github.com/Yubico/python-fido2
 - libfido2
 
 ### 🐧 Linux 🐧
 
 - python3
 - python3-cryptography
+- python-fido2 https://github.com/Yubico/python-fido2
 - fido2-tools
 - zfsutils-linux (assumed installed already for ZFS users)
 - util-linux
+
+### 🪟 Windows 🪟
+
+This section is for the adventurers: it requires the experimental OpenZFS for Windows port and some manual work, it isn't *plug-N-play*!
+
+- python-fido2 https://github.com/Yubico/python-fido2
+
+- `python -m pip install fido2`
+- or `py -3 -m pip install fido2`
+
+```
+python ezfs2fa.py doctor
+```
 
 ---
 

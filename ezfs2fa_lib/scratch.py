@@ -6,6 +6,7 @@ Volatile scratch filesystem management
 
 FreeBSD uses mdmfs(8) with -M, creating a malloc-backed md(4) disk with UFS.
 Linux uses ramfs, mounted directly under /var/run/ezfs2fa.
+Windows falls back to a private temporary directory for compatibility.
 
 Both modes expose the same interface: a private mount point containing a
 regular key file that OpenZFS can consume through file://...
@@ -15,18 +16,19 @@ regular key file that OpenZFS can consume through file://...
 from   __future__ import annotations
 
 import os
-import platform
 import secrets
 import subprocess
+import tempfile
 from   pathlib    import Path
 from   typing     import Optional
 
-from   .common    import Error, ZFS_RAW_KEY_BYTES, eprint, require_commands, run, safe_name
+from   .common    import Error, ZFS_RAW_KEY_BYTES, chmod_private, current_os, eprint, require_commands, run, safe_name
 from   .crypto    import SecretKeyBytes
 
 FREEBSD_SCRATCH_BYTES = 1024 * 1024
 IO_BLOCK_BYTES        = 4096
-RUN_DIR               = Path("/var/run/ezfs2fa")
+UNIX_RUN_DIR          = Path("/var/run/ezfs2fa")
+WINDOWS_RUN_DIR       = Path(tempfile.gettempdir()) / "ezfs2fa"
 KEY_FILENAME          = "zfs.rawkey"
 
 
@@ -38,6 +40,9 @@ class ScratchSpace:
         mdmfs -M -s 1048576b -p 0700 -w root:wheel -o noatime md <mountpoint>
     On Linux, this creates a ramfs mount via:
         mount -t ramfs -o mode=0700 ramfs <mountpoint>
+    On Windows (or any unsupported host), this falls back to a private
+    temporary directory. This mode is compatibility-oriented and does not
+    provide RAM-backed guarantees.
     The key is stored as a regular file so OpenZFS can use a file:// key
     location. The file is wiped before teardown. On FreeBSD, the backing md
     device is also zeroed where possible before detaching.
@@ -45,7 +50,8 @@ class ScratchSpace:
     # --------------------------------------------------------------------------
     def __init__(self, label: str = "zfskey") -> None:
         self.label                      = safe_name(label or "zfskey")
-        self.os_name                    = platform.system()
+        self.os_name                    = current_os()
+        self.run_dir                    = UNIX_RUN_DIR if self.os_name in {"FreeBSD", "Linux"} else WINDOWS_RUN_DIR
         self.path: Optional[Path]       = None
         self.mountpoint: Optional[Path] = None
         self.mount_kind: Optional[str]  = None
@@ -53,10 +59,13 @@ class ScratchSpace:
 
     # --------------------------------------------------------------------------
     def __enter__(self) -> "ScratchSpace":
-        RUN_DIR.mkdir(parents=True, exist_ok=True)
-        os.chmod(RUN_DIR, 0o700)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.run_dir, 0o700)
+        except OSError as exc:
+            eprint(f"WARNING: failed to set 0700 on scratch run dir {self.run_dir}: {exc}")
         unique          = f"{self.label}.{os.getpid()}.{secrets.token_hex(3)}"
-        self.mountpoint = RUN_DIR / unique
+        self.mountpoint = self.run_dir / unique
         self.mountpoint.mkdir(mode=0o700, parents=True, exist_ok=False)
         try:
             if   self.os_name == "FreeBSD":
@@ -64,8 +73,11 @@ class ScratchSpace:
             elif self.os_name == "Linux":
                 self._enter_linux()
             else:
-                raise Error(f"unsupported OS for scratch storage: {self.os_name}")
-            os.chmod(self.mountpoint, 0o700)
+                self._enter_directory()
+            try:
+                os.chmod(self.mountpoint, 0o700)
+            except OSError as exc:
+                eprint(f"WARNING: failed to set 0700 on scratch mountpoint {self.mountpoint}: {exc}")
             return self
         except Exception:
             self.destroy()
@@ -117,6 +129,15 @@ class ScratchSpace:
     # --------------------------------------------------------------------------
 
     # --------------------------------------------------------------------------
+    def _enter_directory(self) -> None:
+        """Create compatibility scratch directory when RAM mounts are unavailable"""
+        if self.mountpoint is None:
+            raise Error("scratch mountpoint is not initialised")
+        self.mount_kind = "directory"
+        self.path       = None
+    # --------------------------------------------------------------------------
+
+    # --------------------------------------------------------------------------
     def _mounted_device(self) -> Optional[Path]:
         """Return /dev/mdX mounted on this mountpoint on FreeBSD"""
         if   self.mountpoint is None: return None
@@ -153,7 +174,7 @@ class ScratchSpace:
             handle.write(key)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(key_path, 0o600)
+        chmod_private(key_path)
     # --------------------------------------------------------------------------
 
     # --------------------------------------------------------------------------
@@ -216,14 +237,16 @@ class ScratchSpace:
         if self.path is None and self.mountpoint is not None and self.os_name == "FreeBSD":
             self.path = self._mounted_device()
         if   self.path is None and self.mountpoint is None: return
-        self._infer_mountpoint()
+        if self.mount_kind in {"freebsd-mdmfs", "linux-ramfs"}:
+            self._infer_mountpoint()
         if self.mountpoint is not None:
             self.wipe_key_file()
             if self.path is None and self.os_name == "FreeBSD":
                 self.path = self._mounted_device()
-            umount_proc = subprocess.run(["umount", str(self.mountpoint)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if umount_proc.returncode != 0:
-                eprint(f"WARNING: failed to unmount scratch path {self.mountpoint}")
+            if self.mount_kind in {"freebsd-mdmfs", "linux-ramfs"}:
+                umount_proc = subprocess.run(["umount", str(self.mountpoint)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if umount_proc.returncode != 0:
+                    eprint(f"WARNING: failed to unmount scratch path {self.mountpoint}")
         if self.os_name == "FreeBSD":
             self._zero_freebsd_md()
             if self.path is not None:
@@ -239,4 +262,5 @@ class ScratchSpace:
                 eprint(f"WARNING: failed to remove scratch directory {self.mountpoint}: {exc}")
         self.path       = None
         self.mountpoint = None
+        self.mount_kind = None
     # --------------------------------------------------------------------------

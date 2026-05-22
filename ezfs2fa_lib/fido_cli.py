@@ -14,7 +14,7 @@ import re
 import secrets
 import subprocess
 
-from   .common      import Error, eprint, require_commands
+from   .common      import Error, current_os, eprint, require_commands
 from   .fido_common import FidoDeviceInfo, choose_from_devices, freebsd_uhid_candidates, ykman_serial_if_single
 from   .scratch     import ScratchSpace
 
@@ -45,7 +45,23 @@ def _write_private(path: str, data: bytes) -> None:
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
-    os.chmod(path, 0o600)
+    try:
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        eprint(f"WARNING: failed to set 0600 on temporary FIDO file {path}: {exc}")
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+def _fido_env() -> Dict[str, str]:
+    """
+    Return environment for libfido2 CLI calls.
+    On Windows with MSYS2 builds, disable argument path-conversion to preserve
+    native HID paths such as \\?\\hid#vid_xxxx...
+    """
+    env = os.environ.copy()
+    env["MSYS2_ARG_CONV_EXCL"] = "*"
+    env["MSYS_NO_PATHCONV"]    = "1"
+    return env
 # ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
@@ -198,14 +214,14 @@ class CliFidoBackend:
 
     # --------------------------------------------------------------------------
     def list_devices(self) -> List[FidoDeviceInfo]:
-        proc = subprocess.run(["fido2-token", "-L"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        proc = subprocess.run(["fido2-token", "-L"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=_fido_env())
         devices_by_path: Dict[str, FidoDeviceInfo] = {}
         serial, serial_source = ykman_serial_if_single()
         if proc.returncode == 0:
             for line in proc.stdout.decode("utf-8", "replace").splitlines():
-                if not line.strip():
-                    continue
-                path, _, text         = line.partition(":")
+                if not line.strip(): continue
+                if ": " in line: path, text = line.rsplit(": ", 1)
+                else:            path, text = line, ""
                 path                  = path.strip()
                 devices_by_path[path] = FidoDeviceInfo(path=path, label=text.strip() or path, backend=self.name)
         # On FreeBSD, fido2-token -L may prefer /dev/hidraw* when hidraw.ko is loaded.
@@ -226,17 +242,35 @@ class CliFidoBackend:
     # --------------------------------------------------------------------------
     def _probe(self, path: str) -> bool:
         try:
-            proc = subprocess.run(["fido2-token", "-I", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            proc = subprocess.run(["fido2-token", "-I", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, env=_fido_env())
         except subprocess.TimeoutExpired:
             return False
         return proc.returncode == 0
     # --------------------------------------------------------------------------
 
     # --------------------------------------------------------------------------
+    def _choose_any(self, devices: List[FidoDeviceInfo]) -> FidoDeviceInfo:
+        """Select from all discovered devices, regardless of probe result"""
+        if len(devices) == 1: return devices[0]
+        print("Available FIDO2 keys (probe fallback):")
+        for index, dev in enumerate(devices, 1):
+            serial = f" serial={dev.serial}" if dev.serial else ""
+            print(f"  [{index}] {dev.label or dev.path}{serial} backend={dev.backend} responsive={dev.responsive}")
+        while True:
+            answer = input("Select FIDO2 key number: ").strip()
+            try:
+                idx = int(answer)
+                if 1 <= idx <= len(devices): return devices[idx - 1]
+            except ValueError:
+                pass
+            print("Invalid selection")
+    # --------------------------------------------------------------------------
+
+    # --------------------------------------------------------------------------
     def _fill_token_info(self, info: FidoDeviceInfo) -> None:
         if   not info.responsive: return
         try:
-            proc = subprocess.run(["fido2-token", "-I", info.path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8)
+            proc = subprocess.run(["fido2-token", "-I", info.path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8, env=_fido_env())
         except Exception as exc:
             eprint(f"WARNING: failed to query FIDO token info on {info.path}: {exc}")
             return
@@ -265,9 +299,12 @@ class CliFidoBackend:
         did not list it or because a preflight probe timed out. Let the real
         fido2-cred/fido2-assert command be the source of truth.
         """
+        devices = self.list_devices()
         if requested:
             if not os.path.exists(requested):
-                raise Error(f"requested FIDO device path does not exist: {requested}")
+                eprint(f"WARNING: requested FIDO device path does not exist on filesystem: {requested}; trying it anyway")
+            for dev in devices:
+                if dev.path == requested or dev.label == requested: return dev
             info                  = FidoDeviceInfo(path=requested, label=requested, backend=self.name, responsive=True)
             serial, serial_source = ykman_serial_if_single()
             info.serial           = serial
@@ -275,8 +312,11 @@ class CliFidoBackend:
             self._fill_token_info(info)
             return info
         try:
-            return choose_from_devices(self.list_devices(), requested)
+            return choose_from_devices(devices, requested)
         except RuntimeError as exc:
+            if current_os() == "Windows" and devices:
+                eprint("WARNING: no responsive FIDO2 key confirmed by probe; falling back to discovered device list on Windows.")
+                return self._choose_any(devices)
             raise Error(str(exc)) from exc
     # --------------------------------------------------------------------------
 
@@ -304,9 +344,13 @@ class CliFidoBackend:
             _write_private(in_path, cred_input)
             output   = b""
             try:
-                proc = subprocess.run(["fido2-cred", "-M", "-h", "-v", "-i", in_path, "-o", out_path, dev.path])
+                proc = subprocess.run(["fido2-cred", "-M", "-h", "-v", "-i", in_path, "-o", out_path, dev.path], env=_fido_env())
                 if proc.returncode != 0:
-                    raise Error("fido2-cred failed. If the key flashes, touch it after entering the PIN.")
+                    raise Error(
+                        "fido2-cred failed. If this is Windows and "
+                        "`fido2-token -I <device-path>` also fails, the key may not support FIDO2/CTAP2 "
+                        "(for example YubiKey 4), or the OS/driver cannot open the authenticator."
+                    )
                 with open(out_path, "rb") as handle:
                     output = handle.read()
             finally:
@@ -340,9 +384,13 @@ class CliFidoBackend:
             _write_private(in_path, assert_input)
             output   = b""
             try:
-                proc = subprocess.run(["fido2-assert", "-G", "-h", "-v", "-i", in_path, "-o", out_path, dev.path])
+                proc = subprocess.run(["fido2-assert", "-G", "-h", "-v", "-i", in_path, "-o", out_path, dev.path], env=_fido_env())
                 if proc.returncode != 0:
-                    raise Error("fido2-assert failed. If the key flashes, touch it after entering the PIN.")
+                    raise Error(
+                        "fido2-assert failed. If this is Windows and "
+                        "`fido2-token -I <device-path>` also fails, the key may not support FIDO2/CTAP2 "
+                        "(for example YubiKey 4), or the OS/driver cannot open the authenticator."
+                    )
                 with open(out_path, "rb") as handle:
                     output = handle.read()
             finally:

@@ -22,7 +22,7 @@ fi
 install_deps_freebsd() {
     if command -v pkg >/dev/null 2>&1; then
         echo "Installing FreeBSD dependencies..."
-        pkg install -y python311 py311-cryptography libfido2 || \
+        pkg install -y python311 py311-cryptography py311-fido2 libfido2 || \
             echo "WARNING: could not install all FreeBSD dependencies, continuing" >&2
     else
         echo "WARNING: pkg not found; skipping FreeBSD dependency installation" >&2
@@ -34,17 +34,17 @@ install_deps_freebsd() {
 # ------------------------------------------------------------------------------
 install_deps_linux() {
     echo "Installing Linux dependencies where available..."
-    if command -v apt-get >/dev/null 2>&1; then
+    if   command -v apt-get >/dev/null 2>&1; then
         if ! apt-get update; then
             echo "WARNING: apt-get update failed, continuing with existing package index" >&2
         fi
-        apt-get install -y python3 python3-cryptography fido2-tools zfsutils-linux util-linux || \
+        apt-get install -y python3 python3-cryptography python3-fido2 libfido2-1 fido2-tools zfsutils-linux util-linux || \
             echo "WARNING: could not install all apt dependencies, continuing" >&2
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y python3 python3-cryptography fido2-tools util-linux zfs || \
+        dnf install -y python3 python3-cryptography python3-fido2 libfido2 fido2-tools util-linux zfs || \
             echo "WARNING: could not install all dnf dependencies. ZFS package names vary by distribution." >&2
     elif command -v pacman >/dev/null 2>&1; then
-        pacman -Sy --needed --noconfirm python python-cryptography libfido2 util-linux zfs-utils || \
+        pacman -Sy --needed --noconfirm python python-cryptography python-fido2 libfido2 util-linux zfs-utils || \
             echo "WARNING: could not install all pacman dependencies. ZFS package names may require an extra repository." >&2
     else
         echo "WARNING: no supported Linux package manager found; skipping dependency installation" >&2

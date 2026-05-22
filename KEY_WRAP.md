@@ -32,7 +32,7 @@ OpenZFS supports these encryption suites:
 OpenZFS supports `keyformat=raw|hex|passphrase`.
 
 - `keyformat=raw` and `keyformat=hex` both represent a 32-byte random key;
-- `keyformat=passphrase` derives a key from a passphrase using PBKDF2 metadata stored by ZFS.
+- `keyformat=passphrase` derives a key from a passphrase using PBKDF2 metadata stored by ZFS (using 2,418,586 iterations).
 
 `eZFS2FA+` uses `keyformat=raw` only, then performs its own local wrapping around that raw key.
 

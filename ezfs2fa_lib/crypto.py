@@ -104,7 +104,7 @@ def _hkdf_expand(
     block   = b""
     counter = 1
     while len(output) < out_len:
-        block = hmac.new(bytes(prk), block + info + bytes([counter]), hashlib.sha512).digest()
+        block    = hmac.new(bytes(prk), block + info + bytes([counter]), hashlib.sha512).digest()
         output.extend(block)
         counter += 1
     return output[:out_len]

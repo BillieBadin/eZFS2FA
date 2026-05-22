@@ -225,3 +225,6 @@ eZFS2FA.code-workspace
 
 # Local stuff
 local/
+
+# Locally generated json config file
+ezfs2fa.json

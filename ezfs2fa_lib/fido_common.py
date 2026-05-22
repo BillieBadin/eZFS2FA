@@ -5,15 +5,15 @@
 Shared FIDO backend structures
 """
 
-from   __future__ import annotations
+from   __future__  import annotations
 
 import os
 import shutil
 import subprocess
 import sys
-from   pathlib import Path
+from   pathlib     import Path
 from   dataclasses import dataclass, field
-from   typing import Any, Dict, List, Optional, Protocol
+from   typing      import Any, Dict, List, Optional, Protocol
 
 # ------------------------------------------------------------------------------
 @dataclass
@@ -21,19 +21,19 @@ class FidoDeviceInfo:
     """A visible FIDO device"""
 
     path:          str
-    label:         str = ""
-    backend:       str = ""
-    vendor_id:     Optional[str] = None
-    product_id:    Optional[str] = None
-    manufacturer:  Optional[str] = None
-    product:       Optional[str] = None
-    aaguid:        Optional[str] = None
-    versions:      List[str] = field(default_factory=list)
-    extensions:    List[str] = field(default_factory=list)
+    label:         str            = ""
+    backend:       str            = ""
+    vendor_id:     Optional[str]  = None
+    product_id:    Optional[str]  = None
+    manufacturer:  Optional[str]  = None
+    product:       Optional[str]  = None
+    aaguid:        Optional[str]  = None
+    versions:      List[str]      = field(default_factory=list)
+    extensions:    List[str]      = field(default_factory=list)
     options:       Dict[str, Any] = field(default_factory=dict)
-    serial:        Optional[int] = None
-    serial_source: Optional[str] = None
-    responsive:    bool = True
+    serial:        Optional[int]  = None
+    serial_source: Optional[str]  = None
+    responsive:    bool           = True
     # --------------------------------------------------------------------------
     def to_json(self) -> Dict[str, Any]:
         """Return JSON-safe metadata"""
@@ -93,9 +93,9 @@ def ykman_serial_if_single() -> tuple[Optional[int], Optional[str]]:
     try:
         proc = subprocess.run(
             [ykman, "list", "--serials"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=5,
+            stdout  = subprocess.PIPE,
+            stderr  = subprocess.PIPE,
+            timeout = 5,
         )
     except subprocess.TimeoutExpired:
         print("WARNING: ykman list --serials timed out; continuing without serial metadata", file=sys.stderr)
